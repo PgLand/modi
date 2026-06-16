@@ -1,4 +1,4 @@
-const CACHE_NAME = 'brvm-gestion-v4';
+const CACHE_NAME = 'brvm-gestion-v5';
 const APP_SHELL = [
   './',
   './index.html',
