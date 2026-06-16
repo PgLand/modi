@@ -1,0 +1,991 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>BRVM Gestion - Spéculation & Long Terme</title>
+    <meta name="description" content="Pilotez vos positions BRVM — Spéculation et Long Terme">
+    <meta name="theme-color" content="#4f46e5">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="BRVM Gestion">
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+    <link rel="apple-touch-icon" href="icons/icon-192.png">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone@7.26.9/babel.min.js"></script>
+    <script src="https://unpkg.com/lucide@0.294.0/dist/umd/lucide.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap');
+        body { font-family: 'Plus Jakarta Sans', sans-serif; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #f1f5f9; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+    <div id="root"></div>
+    <noscript>
+        <p style="padding:2rem;text-align:center;font-family:sans-serif;">
+            JavaScript est requis pour utiliser BRVM Gestion.
+        </p>
+    </noscript>
+
+    <script type="text/babel" data-presets="react">
+        const { useState, useEffect, useMemo } = React;
+
+        // ----- Clés de stockage de l'application fusionnée -----
+        const KEYS = {
+            transactions: 'brvm_fusion_transactions',
+            marketPrices: 'brvm_fusion_market_prices',
+            horizons: 'brvm_fusion_horizons',
+            targets: 'brvm_fusion_targets',
+            strategies: 'brvm_fusion_strategies'
+        };
+
+        // Migration : récupère les données des deux anciennes applications
+        // (long.html -> brvm_lt_*, Speculation.html -> brvm_spec_*) si l'app
+        // fusionnée n'a encore aucune donnée.
+        function safeParse(raw, fallback) {
+            try { return raw ? JSON.parse(raw) : fallback; }
+            catch (e) { console.warn('Données localStorage invalides, réinitialisation.', e); return fallback; }
+        }
+
+        function migrateOldData() {
+            if (localStorage.getItem(KEYS.transactions)) return null;
+
+            const ltTx = safeParse(localStorage.getItem('brvm_lt_transactions'), []);
+            const specTx = safeParse(localStorage.getItem('brvm_spec_transactions'), []);
+            if (ltTx.length === 0 && specTx.length === 0) return null;
+
+            const tagged = [
+                ...specTx.map(t => ({ ...t, id: 'spec_' + t.id, poche: 'SPEC' })),
+                ...ltTx.map(t => ({ ...t, id: 'lt_' + t.id, poche: 'LT' }))
+            ].sort((a, b) => (a.date < b.date ? 1 : -1));
+
+            const ltPrices = safeParse(localStorage.getItem('brvm_lt_market_prices'), {});
+            const specPrices = safeParse(localStorage.getItem('brvm_spec_market_prices'), {});
+            const horizons = safeParse(localStorage.getItem('brvm_lt_horizons'), {});
+
+            const strategies = {};
+            specTx.forEach(t => { if (t.quantite) strategies[t.libelle] = 'SPEC'; });
+            ltTx.forEach(t => { if (t.quantite) strategies[t.libelle] = 'LT'; });
+
+            return {
+                transactions: tagged,
+                marketPrices: { ...ltPrices, ...specPrices },
+                horizons,
+                strategies
+            };
+        }
+
+        const MIGRATED = migrateOldData();
+
+        function loadState(key, fallback) {
+            return safeParse(localStorage.getItem(key), fallback);
+        }
+
+        function App() {
+            const [transactions, setTransactions] = useState(() =>
+                loadState(KEYS.transactions, MIGRATED ? MIGRATED.transactions : [])
+            );
+            const [marketPrices, setMarketPrices] = useState(() =>
+                loadState(KEYS.marketPrices, MIGRATED ? MIGRATED.marketPrices : {})
+            );
+            const [horizons, setHorizons] = useState(() =>
+                loadState(KEYS.horizons, MIGRATED ? MIGRATED.horizons : {})
+            );
+            const [targets, setTargets] = useState(() => loadState(KEYS.targets, {}));
+            const [strategies, setStrategies] = useState(() =>
+                loadState(KEYS.strategies, MIGRATED ? MIGRATED.strategies : {})
+            );
+
+            useEffect(() => { localStorage.setItem(KEYS.transactions, JSON.stringify(transactions)); }, [transactions]);
+            useEffect(() => { localStorage.setItem(KEYS.marketPrices, JSON.stringify(marketPrices)); }, [marketPrices]);
+            useEffect(() => { localStorage.setItem(KEYS.horizons, JSON.stringify(horizons)); }, [horizons]);
+            useEffect(() => { localStorage.setItem(KEYS.targets, JSON.stringify(targets)); }, [targets]);
+            useEffect(() => { localStorage.setItem(KEYS.strategies, JSON.stringify(strategies)); }, [strategies]);
+
+            // États de navigation et de formulaire
+            const [activeTab, setActiveTab] = useState("dashboard"); // dashboard, transactions, strategie
+            const [formType, setFormType] = useState("ACHAT");
+            const [formPoche, setFormPoche] = useState("SPEC"); // SPEC ou LT
+            const [ticker, setTicker] = useState("");
+            const [quantite, setQuantite] = useState("");
+            const [cours, setCours] = useState("");
+            const [dateOp, setDateOp] = useState(new Date().toISOString().split('T')[0]);
+            const [fluxMontant, setFluxMontant] = useState("");
+            const [fraisManuels, setFraisManuels] = useState("");
+            const [filtrePoche, setFiltrePoche] = useState("TOUS"); // TOUS, SPEC, LT
+            const [installPrompt, setInstallPrompt] = useState(null);
+            const [canInstall, setCanInstall] = useState(false);
+            const [showInstallGuide, setShowInstallGuide] = useState(false);
+            const [isInstalled, setIsInstalled] = useState(
+                () => window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true
+            );
+
+            const installGuide = useMemo(() => {
+                const ua = navigator.userAgent;
+                const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+                const isAndroid = /Android/.test(ua);
+
+                if (location.protocol === 'file:') {
+                    return {
+                        title: 'Étape requise avant l\'installation',
+                        steps: [
+                            'Fermez cette page ouverte directement depuis le dossier.',
+                            'Double-cliquez sur demarrer.bat dans le dossier modi.',
+                            'Une fois la page ouverte dans Chrome (adresse http://...), revenez ici et touchez « Ajouter à l\'écran d\'accueil ».'
+                        ]
+                    };
+                }
+                if (isIOS) {
+                    return {
+                        title: 'iPhone / iPad (Safari ou Chrome)',
+                        steps: [
+                            'Appuyez sur le bouton Partager (carré avec une flèche vers le haut).',
+                            'Faites défiler et choisissez « Sur l\'écran d\'accueil ».',
+                            'Appuyez sur « Ajouter » en haut à droite.'
+                        ]
+                    };
+                }
+                if (isAndroid) {
+                    return {
+                        title: 'Android (Chrome)',
+                        steps: [
+                            'Appuyez sur le menu ⋮ en haut à droite du navigateur.',
+                            'Choisissez « Installer l\'application » ou « Ajouter à l\'écran d\'accueil ».',
+                            'Confirmez — l\'icône BRVM apparaîtra sur votre écran d\'accueil.'
+                        ]
+                    };
+                }
+                return {
+                    title: 'Ordinateur (Chrome / Edge)',
+                    steps: [
+                        'Cliquez sur l\'icône d\'installation (⊕ ou petit écran) dans la barre d\'adresse.',
+                        'Ou ouvrez le menu ⋮ → « Installer BRVM Gestion... ».',
+                        'L\'application sera ajoutée au bureau ou au menu Démarrer.'
+                    ]
+                };
+            }, []);
+
+            // Convertit les icônes Lucide après changement d'écran (évite les boucles infinies)
+            useEffect(() => {
+                const timer = setTimeout(() => {
+                    if (typeof lucide !== 'undefined') lucide.createIcons();
+                }, 50);
+                return () => clearTimeout(timer);
+            }, [activeTab, transactions.length, canInstall, isInstalled, filtrePoche, showInstallGuide]);
+
+            // Capture l'événement d'installation PWA proposé par Chrome
+            useEffect(() => {
+                const onBeforeInstall = (e) => {
+                    e.preventDefault();
+                    setInstallPrompt(e);
+                    setCanInstall(true);
+                };
+                const onInstalled = () => {
+                    setCanInstall(false);
+                    setInstallPrompt(null);
+                    setIsInstalled(true);
+                };
+                window.addEventListener('beforeinstallprompt', onBeforeInstall);
+                window.addEventListener('appinstalled', onInstalled);
+                return () => {
+                    window.removeEventListener('beforeinstallprompt', onBeforeInstall);
+                    window.removeEventListener('appinstalled', onInstalled);
+                };
+            }, []);
+
+            const handleInstallApp = async () => {
+                if (installPrompt) {
+                    installPrompt.prompt();
+                    const { outcome } = await installPrompt.userChoice;
+                    setShowInstallGuide(false);
+                    if (outcome === 'accepted') {
+                        setCanInstall(false);
+                        setIsInstalled(true);
+                    }
+                    setInstallPrompt(null);
+                    return;
+                }
+                setShowInstallGuide(true);
+            };
+
+            const formatFCFA = (val) =>
+                new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'XOF', minimumFractionDigits: 0 }).format(val).replace('XOF', 'FCFA');
+
+            // Trésorerie commune aux deux poches
+            const cashDisponible = useMemo(() => {
+                let solde = 0;
+                transactions.forEach(t => {
+                    if (t.type === "DEPOT") solde += t.credit;
+                    else if (t.type === "RETRAIT") solde -= t.debit;
+                    else if (t.type === "ACHAT") solde -= t.debit;
+                    else if (t.type === "VENTE") solde += t.credit;
+                });
+                return solde;
+            }, [transactions]);
+
+            // Positions consolidées (PRU frais inclus), toutes poches confondues
+            const positions = useMemo(() => {
+                const map = {};
+                transactions.forEach(t => {
+                    if (t.type === "ACHAT") {
+                        if (!map[t.libelle]) map[t.libelle] = { quantite: 0, coutTotal: 0 };
+                        map[t.libelle].quantite += t.quantite;
+                        map[t.libelle].coutTotal += t.debit;
+                    } else if (t.type === "VENTE") {
+                        if (map[t.libelle] && map[t.libelle].quantite > 0) {
+                            const ratio = t.quantite / map[t.libelle].quantite;
+                            map[t.libelle].coutTotal -= map[t.libelle].coutTotal * ratio;
+                            map[t.libelle].quantite -= t.quantite;
+                        }
+                    }
+                });
+
+                const actives = [];
+                Object.keys(map).forEach(key => {
+                    if (map[key].quantite > 0) {
+                        const pru = map[key].coutTotal / map[key].quantite;
+                        const coursActuel = marketPrices[key] || pru;
+                        const valeurActuelle = map[key].quantite * coursActuel;
+                        const plusValue = valeurActuelle - map[key].coutTotal;
+                        actives.push({
+                            symbole: key,
+                            strategie: strategies[key] || 'SPEC',
+                            quantite: map[key].quantite,
+                            coutTotal: map[key].coutTotal,
+                            pru,
+                            coursActuel,
+                            valeurActuelle,
+                            plusValue,
+                            performance: map[key].coutTotal > 0 ? (plusValue / map[key].coutTotal) * 100 : 0
+                        });
+                    }
+                });
+                return actives;
+            }, [transactions, marketPrices, strategies]);
+
+            const positionsFiltrees = useMemo(() =>
+                filtrePoche === "TOUS" ? positions : positions.filter(p => p.strategie === filtrePoche),
+            [positions, filtrePoche]);
+
+            // Indicateurs globaux
+            const valeurTotale = useMemo(() =>
+                positions.reduce((acc, p) => acc + p.valeurActuelle, 0) + cashDisponible,
+            [positions, cashDisponible]);
+
+            const capitalNet = useMemo(() => transactions.reduce((acc, t) => {
+                if (t.type === "DEPOT") return acc + t.credit;
+                if (t.type === "RETRAIT") return acc - t.debit;
+                return acc;
+            }, 0), [transactions]);
+
+            const gainGlobal = valeurTotale - capitalNet;
+            const perfGlobale = capitalNet > 0 ? (gainGlobal / capitalNet) * 100 : 0;
+
+            const totalLatent = positions.reduce((acc, p) => acc + p.plusValue, 0);
+            const totalCout = positions.reduce((acc, p) => acc + p.coutTotal, 0);
+            const latentPct = totalCout > 0 ? (totalLatent / totalCout) * 100 : 0;
+
+            // Valeur par poche pour la répartition
+            const valeurParPoche = useMemo(() => {
+                const res = { SPEC: 0, LT: 0 };
+                positions.forEach(p => { res[p.strategie] += p.valeurActuelle; });
+                return res;
+            }, [positions]);
+
+            // Enregistrement d'un mouvement
+            const handleAddTransaction = (e) => {
+                e.preventDefault();
+                const id = Date.now().toString();
+
+                if (formType === "DEPOT" || formType === "RETRAIT") {
+                    const mt = parseFloat(fluxMontant);
+                    if (isNaN(mt) || mt <= 0) return;
+
+                    setTransactions([{
+                        id, date: dateOp, type: formType,
+                        libelle: formType === "DEPOT" ? "Apport de capital" : "Retrait de fonds",
+                        montant: mt,
+                        debit: formType === "RETRAIT" ? mt : 0,
+                        credit: formType === "DEPOT" ? mt : 0
+                    }, ...transactions]);
+                    setFluxMontant("");
+                } else {
+                    const qty = parseInt(quantite);
+                    const price = parseFloat(cours);
+                    const sym = ticker.toUpperCase().trim();
+                    if (!sym || isNaN(qty) || qty <= 0 || isNaN(price) || price <= 0) return;
+
+                    const totalBrut = qty * price;
+                    // Frais de courtage estimés à ~1,22% si non renseignés
+                    const frais = fraisManuels ? parseFloat(fraisManuels) : Math.round(totalBrut * 0.0122);
+
+                    let debit = 0, credit = 0;
+                    if (formType === "ACHAT") {
+                        debit = totalBrut + frais;
+                        if (debit > cashDisponible) {
+                            alert("Trésorerie insuffisante pour exécuter cet achat !");
+                            return;
+                        }
+                    } else {
+                        credit = totalBrut - frais;
+                    }
+
+                    if (!marketPrices[sym]) setMarketPrices({ ...marketPrices, [sym]: price });
+                    if (formType === "ACHAT") {
+                        if (!strategies[sym]) setStrategies({ ...strategies, [sym]: formPoche });
+                        if (formPoche === "LT" && !horizons[sym]) {
+                            setHorizons({ ...horizons, [sym]: new Date().getFullYear() + 5 });
+                        }
+                    }
+
+                    setTransactions([{
+                        id, date: dateOp, type: formType, libelle: sym,
+                        poche: strategies[sym] || formPoche,
+                        quantite: qty, cours: price, debit, credit
+                    }, ...transactions]);
+                    setTicker(""); setQuantite(""); setCours(""); setFraisManuels("");
+                }
+            };
+
+            const handleDeleteTransaction = (id) => {
+                if (confirm("Voulez-vous vraiment supprimer cette ligne de transaction ?")) {
+                    setTransactions(transactions.filter(t => t.id !== id));
+                }
+            };
+
+            const handleUpdateMarketPrice = (sym, val) => {
+                const p = parseFloat(val);
+                if (!isNaN(p)) setMarketPrices({ ...marketPrices, [sym]: p });
+            };
+
+            const handleUpdateHorizon = (sym, val) => setHorizons({ ...horizons, [sym]: val });
+
+            const handleUpdateTargets = (sym, field, value) => {
+                const val = parseFloat(value);
+                setTargets({
+                    ...targets,
+                    [sym]: { ...(targets[sym] || { stopLoss: 0, takeProfit: 0 }), [field]: isNaN(val) ? 0 : val }
+                });
+            };
+
+            const handleToggleStrategie = (sym) => {
+                const next = (strategies[sym] || 'SPEC') === 'SPEC' ? 'LT' : 'SPEC';
+                setStrategies({ ...strategies, [sym]: next });
+                if (next === 'LT' && !horizons[sym]) {
+                    setHorizons({ ...horizons, [sym]: new Date().getFullYear() + 5 });
+                }
+            };
+
+            const handleResetAll = () => {
+                if (confirm("Voulez-vous effacer l'intégralité des données (transactions, cours, objectifs) ?")) {
+                    setTransactions([]); setMarketPrices({}); setHorizons({}); setTargets({}); setStrategies({});
+                }
+            };
+
+            const BadgeStrategie = ({ strategie, onClick }) => (
+                <button
+                    type="button"
+                    onClick={onClick}
+                    title="Cliquer pour basculer la stratégie"
+                    className={`px-2 py-0.5 rounded-full text-[10px] font-bold tracking-wide uppercase transition ${
+                        strategie === 'SPEC'
+                            ? 'bg-indigo-50 text-indigo-700 border border-indigo-200 hover:bg-indigo-100'
+                            : 'bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100'
+                    }`}
+                >
+                    {strategie === 'SPEC' ? 'Spéculation' : 'Long Terme'}
+                </button>
+            );
+
+            return (
+                <div className="max-w-7xl mx-auto px-4 py-6 md:py-10">
+
+                    {/* Header */}
+                    <header className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8 border-b border-slate-200 pb-6">
+                        <div>
+                            <div className="flex items-center gap-2 mb-1">
+                                <span className="p-1.5 bg-gradient-to-br from-indigo-600 to-emerald-600 rounded-lg text-white">
+                                    <i data-lucide="trending-up" className="w-6 h-6"></i>
+                                </span>
+                                <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight text-slate-900">BRVM Gestion Unifiée</h1>
+                            </div>
+                            <p className="text-slate-500 text-sm">Pilotez vos positions spéculatives et votre patrimoine long terme dans un seul outil.</p>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                            {!isInstalled && (
+                                <button
+                                    onClick={handleInstallApp}
+                                    className="text-xs text-white bg-indigo-600 hover:bg-indigo-700 px-3 py-1.5 rounded-lg border border-indigo-700 transition flex items-center gap-1.5 font-bold shadow-sm"
+                                >
+                                    <i data-lucide="smartphone" className="w-3.5 h-3.5"></i> Ajouter à l'écran d'accueil
+                                </button>
+                            )}
+                            {isInstalled && (
+                                <span className="text-xs text-emerald-600 bg-emerald-50 px-3 py-1.5 rounded-lg border border-emerald-200 font-bold flex items-center gap-1.5">
+                                    <i data-lucide="check-circle" className="w-3.5 h-3.5"></i> Sur l'écran d'accueil
+                                </span>
+                            )}
+                            <button
+                                onClick={handleResetAll}
+                                className="text-xs text-slate-400 hover:text-rose-600 px-3 py-1.5 rounded-lg border border-slate-200 hover:border-rose-200 transition bg-white"
+                            >
+                                Tout réinitialiser
+                            </button>
+                        </div>
+                    </header>
+
+                    {/* Guide d'installation sur l'écran d'accueil */}
+                    {showInstallGuide && !isInstalled && (
+                        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4 bg-slate-900/50" onClick={() => setShowInstallGuide(false)}>
+                            <div className="bg-white rounded-2xl shadow-xl max-w-md w-full p-6 border border-slate-200" onClick={(e) => e.stopPropagation()}>
+                                <div className="flex items-start justify-between gap-3 mb-4">
+                                    <div>
+                                        <h2 className="text-lg font-black text-slate-900">Ajouter à l'écran d'accueil</h2>
+                                        <p className="text-xs text-slate-500 mt-1">{installGuide.title}</p>
+                                    </div>
+                                    <button onClick={() => setShowInstallGuide(false)} className="text-slate-400 hover:text-slate-700 p-1">
+                                        <i data-lucide="x" className="w-5 h-5"></i>
+                                    </button>
+                                </div>
+                                <ol className="space-y-3 mb-5">
+                                    {installGuide.steps.map((step, i) => (
+                                        <li key={i} className="flex gap-3 text-sm text-slate-700">
+                                            <span className="flex-shrink-0 w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 font-bold text-xs flex items-center justify-center">{i + 1}</span>
+                                            <span>{step}</span>
+                                        </li>
+                                    ))}
+                                </ol>
+                                {canInstall && (
+                                    <button
+                                        onClick={handleInstallApp}
+                                        className="w-full py-2.5 mb-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-bold rounded-lg"
+                                    >
+                                        Installer maintenant (automatique)
+                                    </button>
+                                )}
+                                <button
+                                    onClick={() => setShowInstallGuide(false)}
+                                    className="w-full py-2 text-sm font-semibold text-slate-500 hover:text-slate-800"
+                                >
+                                    J'ai compris
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Navigation */}
+                    <div className="flex border-b border-slate-200 mb-6 gap-2 overflow-x-auto">
+                        <button onClick={() => setActiveTab("dashboard")} className={`px-4 py-2.5 font-bold text-sm border-b-2 flex items-center gap-2 whitespace-nowrap ${activeTab === "dashboard" ? "border-indigo-600 text-indigo-600" : "border-transparent text-slate-500 hover:text-slate-900"}`}>
+                            <i data-lucide="layout-dashboard" className="w-4 h-4"></i> Tableau de bord
+                        </button>
+                        <button onClick={() => setActiveTab("transactions")} className={`px-4 py-2.5 font-bold text-sm border-b-2 flex items-center gap-2 whitespace-nowrap ${activeTab === "transactions" ? "border-indigo-600 text-indigo-600" : "border-transparent text-slate-500 hover:text-slate-900"}`}>
+                            <i data-lucide="list" className="w-4 h-4"></i> Journal des opérations ({transactions.length})
+                        </button>
+                        <button onClick={() => setActiveTab("strategie")} className={`px-4 py-2.5 font-bold text-sm border-b-2 flex items-center gap-2 whitespace-nowrap ${activeTab === "strategie" ? "border-indigo-600 text-indigo-600" : "border-transparent text-slate-500 hover:text-slate-900"}`}>
+                            <i data-lucide="target" className="w-4 h-4"></i> Objectifs & Stratégie
+                        </button>
+                    </div>
+
+                    {/* VUE : TABLEAU DE BORD */}
+                    {activeTab === "dashboard" && (
+                        <div className="space-y-6">
+
+                            {/* Chiffres clés */}
+                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                                <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                                    <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Patrimoine Total</span>
+                                    <h3 className="text-2xl font-black text-slate-900 mt-1">{formatFCFA(valeurTotale)}</h3>
+                                    <span className={`text-xs font-bold ${gainGlobal >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                        {gainGlobal >= 0 ? '+' : ''}{formatFCFA(gainGlobal)} ({gainGlobal >= 0 ? '+' : ''}{perfGlobale.toFixed(2)}%)
+                                    </span>
+                                </div>
+                                <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                                    <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Liquidités (Cash)</span>
+                                    <h3 className="text-2xl font-black text-indigo-600 mt-1">{formatFCFA(cashDisponible)}</h3>
+                                    <p className="text-xs text-slate-400 mt-1">Prêt pour de nouveaux achats</p>
+                                </div>
+                                <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                                    <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Capital Net Injecté</span>
+                                    <h3 className="text-2xl font-black text-slate-800 mt-1">{formatFCFA(capitalNet)}</h3>
+                                    <p className="text-xs text-slate-400 mt-1">Dépôts moins retraits</p>
+                                </div>
+                                <div className="bg-white p-5 rounded-xl border border-indigo-100 bg-indigo-50/20 shadow-sm">
+                                    <span className="text-xs font-bold text-indigo-600 uppercase tracking-wider">Plus-value Latente</span>
+                                    <h3 className={`text-2xl font-black mt-1 ${totalLatent >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                        {totalLatent >= 0 ? '+' : ''}{formatFCFA(totalLatent)}
+                                    </h3>
+                                    <span className={`text-xs font-bold ${totalLatent >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                        {totalLatent >= 0 ? 'Hausse' : 'Baisse'} de {latentPct.toFixed(2)}% sur vos actifs
+                                    </span>
+                                </div>
+                            </div>
+
+                            {/* Répartition par poche */}
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div className="bg-white p-4 rounded-xl border border-indigo-100 shadow-sm flex items-center justify-between">
+                                    <div>
+                                        <span className="text-xs font-bold text-indigo-600 uppercase tracking-wider">Poche Spéculation</span>
+                                        <h3 className="text-xl font-black text-slate-900">{formatFCFA(valeurParPoche.SPEC)}</h3>
+                                    </div>
+                                    <i data-lucide="zap" className="w-8 h-8 text-indigo-200"></i>
+                                </div>
+                                <div className="bg-white p-4 rounded-xl border border-emerald-100 shadow-sm flex items-center justify-between">
+                                    <div>
+                                        <span className="text-xs font-bold text-emerald-600 uppercase tracking-wider">Poche Long Terme</span>
+                                        <h3 className="text-xl font-black text-slate-900">{formatFCFA(valeurParPoche.LT)}</h3>
+                                    </div>
+                                    <i data-lucide="line-chart" className="w-8 h-8 text-emerald-200"></i>
+                                </div>
+                            </div>
+
+                            {/* Formulaire + Portefeuille */}
+                            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+                                {/* Formulaire */}
+                                <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm h-fit">
+                                    <h2 className="text-base font-bold text-slate-900 mb-4 flex items-center gap-2">
+                                        <i data-lucide="plus-circle" className="text-indigo-600 w-5 h-5"></i> Enregistrer un mouvement
+                                    </h2>
+                                    <form onSubmit={handleAddTransaction} className="space-y-4">
+                                        <div className="grid grid-cols-2 gap-1 bg-slate-100 p-1 rounded-lg text-xs font-bold">
+                                            {["ACHAT", "VENTE", "DEPOT", "RETRAIT"].map(t => (
+                                                <button key={t} type="button" onClick={() => setFormType(t)} className={`py-1.5 rounded-md transition-all ${formType === t ? 'bg-white shadow text-indigo-600' : 'text-slate-400 hover:text-slate-600'}`}>
+                                                    {t}
+                                                </button>
+                                            ))}
+                                        </div>
+
+                                        {(formType === "ACHAT" || formType === "VENTE") ? (
+                                            <>
+                                                {formType === "ACHAT" && (
+                                                    <div>
+                                                        <label className="block text-[11px] font-bold text-slate-500 mb-1">Stratégie de la position</label>
+                                                        <div className="grid grid-cols-2 gap-1 bg-slate-100 p-1 rounded-lg text-xs font-bold">
+                                                            <button type="button" onClick={() => setFormPoche("SPEC")} className={`py-1.5 rounded-md transition-all ${formPoche === "SPEC" ? 'bg-white shadow text-indigo-600' : 'text-slate-400'}`}>
+                                                                Spéculation
+                                                            </button>
+                                                            <button type="button" onClick={() => setFormPoche("LT")} className={`py-1.5 rounded-md transition-all ${formPoche === "LT" ? 'bg-white shadow text-emerald-600' : 'text-slate-400'}`}>
+                                                                Long Terme
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                                <div className="grid grid-cols-3 gap-2">
+                                                    <div className="col-span-2">
+                                                        <label className="block text-[11px] font-bold text-slate-500 mb-1">Symbole Action (ex: FTSC)</label>
+                                                        <input type="text" value={ticker} onChange={(e) => setTicker(e.target.value)} placeholder="ex: BOAS" className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg font-bold uppercase focus:outline-none focus:border-indigo-600" required />
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-[11px] font-bold text-slate-500 mb-1">Date</label>
+                                                        <input type="date" value={dateOp} onChange={(e) => setDateOp(e.target.value)} className="w-full px-2 py-1.5 text-xs border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-600" required />
+                                                    </div>
+                                                </div>
+                                                <div className="grid grid-cols-2 gap-2">
+                                                    <div>
+                                                        <label className="block text-[11px] font-bold text-slate-500 mb-1">Quantité</label>
+                                                        <input type="number" value={quantite} onChange={(e) => setQuantite(e.target.value)} placeholder="0" className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-600" required />
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-[11px] font-bold text-slate-500 mb-1">Cours (XOF)</label>
+                                                        <input type="number" value={cours} onChange={(e) => setCours(e.target.value)} placeholder="ex: 2200" className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-600" required />
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-[11px] font-bold text-slate-500 mb-1 flex justify-between">
+                                                        <span>Frais de courtage (Facultatif)</span>
+                                                        <span className="text-[10px] text-indigo-500 font-normal">~1.22% si vide</span>
+                                                    </label>
+                                                    <input type="number" value={fraisManuels} onChange={(e) => setFraisManuels(e.target.value)} placeholder="Laisser vide pour estimation" className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg text-slate-500 focus:outline-none focus:border-indigo-600" />
+                                                </div>
+                                            </>
+                                        ) : (
+                                            <div className="grid grid-cols-2 gap-2">
+                                                <div>
+                                                    <label className="block text-[11px] font-bold text-slate-500 mb-1">Montant (FCFA)</label>
+                                                    <input type="number" value={fluxMontant} onChange={(e) => setFluxMontant(e.target.value)} placeholder="ex: 100000" className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg font-bold focus:outline-none focus:border-indigo-600" required />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-[11px] font-bold text-slate-500 mb-1">Date</label>
+                                                    <input type="date" value={dateOp} onChange={(e) => setDateOp(e.target.value)} className="w-full px-2 py-1.5 text-xs border border-slate-200 rounded-lg focus:outline-none focus:border-indigo-600" required />
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        <button type="submit" className={`w-full py-2 px-4 text-white text-sm font-bold rounded-lg transition-colors ${formType === 'ACHAT' ? 'bg-emerald-600 hover:bg-emerald-700' : formType === 'VENTE' ? 'bg-amber-600 hover:bg-amber-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}>
+                                            Enregistrer dans le Journal
+                                        </button>
+                                    </form>
+                                </div>
+
+                                {/* Portefeuille */}
+                                <div className="lg:col-span-2 bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                                    <div className="flex flex-col sm:flex-row justify-between sm:items-center gap-3 mb-4">
+                                        <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                                            <i data-lucide="wallet" className="text-indigo-600 w-5 h-5"></i> Actifs Détenus
+                                        </h2>
+                                        <div className="flex gap-1 bg-slate-100 p-1 rounded-lg text-xs font-bold">
+                                            {[["TOUS", "Tous"], ["SPEC", "Spéculation"], ["LT", "Long Terme"]].map(([val, lbl]) => (
+                                                <button key={val} type="button" onClick={() => setFiltrePoche(val)} className={`px-3 py-1 rounded-md transition-all ${filtrePoche === val ? 'bg-white shadow text-indigo-600' : 'text-slate-400 hover:text-slate-600'}`}>
+                                                    {lbl}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    {positionsFiltrees.length === 0 ? (
+                                        <div className="text-center py-12 text-slate-400">
+                                            <i data-lucide="inbox" className="w-10 h-10 mx-auto mb-2 opacity-20"></i>
+                                            <p className="text-sm">Aucune action en portefeuille pour ce filtre.</p>
+                                            <p className="text-xs text-slate-400 mt-1">Saisissez un premier achat pour commencer le suivi.</p>
+                                        </div>
+                                    ) : (
+                                        <div className="overflow-x-auto">
+                                            <table className="w-full text-left text-xs border-collapse">
+                                                <thead>
+                                                    <tr className="border-b border-slate-100 text-slate-400 font-bold uppercase">
+                                                        <th className="py-2">Actif</th>
+                                                        <th className="py-2">Stratégie</th>
+                                                        <th className="py-2 text-center">Qté</th>
+                                                        <th className="py-2 text-right">P.R.U (frais incl.)</th>
+                                                        <th className="py-2 text-right">Cours Actuel</th>
+                                                        <th className="py-2 text-right">Valeur Actuelle</th>
+                                                        <th className="py-2 text-right">Plus/Moins-Value</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody className="divide-y divide-slate-100 font-medium text-slate-700">
+                                                    {positionsFiltrees.map(pos => (
+                                                        <tr key={pos.symbole} className="hover:bg-slate-50/50 transition-colors">
+                                                            <td className="py-3 font-bold text-slate-900">{pos.symbole}</td>
+                                                            <td className="py-3">
+                                                                <BadgeStrategie strategie={pos.strategie} onClick={() => handleToggleStrategie(pos.symbole)} />
+                                                            </td>
+                                                            <td className="py-3 text-center">{pos.quantite}</td>
+                                                            <td className="py-3 text-right">{formatFCFA(pos.pru)}</td>
+                                                            <td className="py-3 text-right">
+                                                                <div className="flex items-center justify-end gap-1.5">
+                                                                    <input
+                                                                        type="number"
+                                                                        value={pos.coursActuel}
+                                                                        onChange={(e) => handleUpdateMarketPrice(pos.symbole, e.target.value)}
+                                                                        className="w-20 px-1.5 py-0.5 text-right font-bold border border-slate-200 rounded bg-slate-50 focus:outline-none focus:border-indigo-600"
+                                                                    />
+                                                                    <span className="text-[10px] text-slate-400">XOF</span>
+                                                                </div>
+                                                            </td>
+                                                            <td className="py-3 text-right font-semibold text-slate-800">{formatFCFA(pos.valeurActuelle)}</td>
+                                                            <td className="py-3 text-right">
+                                                                <span className={`font-bold ${pos.plusValue >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                                                    {pos.plusValue >= 0 ? '+' : ''}{pos.performance.toFixed(2)}%
+                                                                </span>
+                                                                <div className="text-[10px] text-slate-400">{formatFCFA(pos.plusValue)}</div>
+                                                            </td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    )}
+
+                                    {positionsFiltrees.length > 0 && (
+                                        <div className="mt-4 pt-4 border-t border-slate-100 bg-slate-50 -mx-5 -mb-5 p-5 rounded-b-xl">
+                                            <p className="text-xs text-slate-500">
+                                                <strong className="text-slate-700">Astuce :</strong> mettez à jour la colonne <strong>"Cours Actuel"</strong> avec les cours du marché pour recalculer instantanément vos plus-values. Cliquez sur le badge de stratégie pour basculer une action entre Spéculation et Long Terme.
+                                            </p>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* VUE : JOURNAL */}
+                    {activeTab === "transactions" && (
+                        <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+                            <div className="p-5 border-b border-slate-100">
+                                <h2 className="text-base font-bold text-slate-900">Historique des mouvements de fonds & d'actions</h2>
+                                <p className="text-xs text-slate-500">Toutes les opérations (poches Spéculation et Long Terme confondues), par ordre chronologique décroissant.</p>
+                            </div>
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left text-xs border-collapse">
+                                    <thead>
+                                        <tr className="bg-slate-50 text-slate-400 font-bold uppercase border-b border-slate-100">
+                                            <th className="px-5 py-3">Date</th>
+                                            <th className="px-5 py-3">Type</th>
+                                            <th className="px-5 py-3">Poche</th>
+                                            <th className="px-5 py-3">Détail Opération / Actif</th>
+                                            <th className="px-5 py-3 text-right">Débit (Achat/Sortie)</th>
+                                            <th className="px-5 py-3 text-right">Crédit (Dépôt/Vente)</th>
+                                            <th className="px-5 py-3 text-center">Action</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-slate-100 font-medium text-slate-700">
+                                        {transactions.map((t) => (
+                                            <tr key={t.id} className="hover:bg-slate-50/50 transition-colors">
+                                                <td className="px-5 py-3 whitespace-nowrap text-slate-500">{t.date.split('-').reverse().join('/')}</td>
+                                                <td className="px-5 py-3 whitespace-nowrap">
+                                                    <span className={`inline-flex px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                                                        t.type === 'ACHAT' ? 'bg-emerald-50 text-emerald-700' :
+                                                        t.type === 'VENTE' ? 'bg-amber-50 text-amber-700' :
+                                                        t.type === 'DEPOT' ? 'bg-blue-50 text-blue-700' :
+                                                        'bg-rose-50 text-rose-700'
+                                                    }`}>
+                                                        {t.type}
+                                                    </span>
+                                                </td>
+                                                <td className="px-5 py-3 whitespace-nowrap">
+                                                    {(t.type === 'ACHAT' || t.type === 'VENTE') ? (
+                                                        <span className={`text-[10px] font-bold uppercase ${ (strategies[t.libelle] || t.poche) === 'LT' ? 'text-emerald-600' : 'text-indigo-600'}`}>
+                                                            {(strategies[t.libelle] || t.poche) === 'LT' ? 'Long Terme' : 'Spéculation'}
+                                                        </span>
+                                                    ) : <span className="text-slate-300">—</span>}
+                                                </td>
+                                                <td className="px-5 py-3">
+                                                    <div className="font-bold text-slate-950">
+                                                        {t.type === 'ACHAT' || t.type === 'VENTE' ? `Action ${t.libelle}` : t.libelle}
+                                                    </div>
+                                                    {(t.type === 'ACHAT' || t.type === 'VENTE') && (
+                                                        <div className="text-[11px] text-slate-400">
+                                                            Qté: {t.quantite} × Cours: {formatFCFA(t.cours)} (Frais incl.)
+                                                        </div>
+                                                    )}
+                                                </td>
+                                                <td className="px-5 py-3 text-right font-semibold text-rose-600">{t.debit > 0 ? formatFCFA(t.debit) : "-"}</td>
+                                                <td className="px-5 py-3 text-right font-semibold text-emerald-600">{t.credit > 0 ? formatFCFA(t.credit) : "-"}</td>
+                                                <td className="px-5 py-3 text-center">
+                                                    <button onClick={() => handleDeleteTransaction(t.id)} className="text-slate-300 hover:text-rose-600 p-1 rounded-md hover:bg-slate-100 transition" title="Supprimer la transaction">
+                                                        <i data-lucide="trash-2" className="w-4 h-4 mx-auto"></i>
+                                                    </button>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* VUE : OBJECTIFS & STRATÉGIE */}
+                    {activeTab === "strategie" && (
+                        <div className="space-y-6">
+
+                            {/* Bannière explicative */}
+                            <div className="bg-gradient-to-r from-indigo-900 to-slate-900 text-white p-6 rounded-xl shadow-md relative overflow-hidden">
+                                <div className="z-10 relative max-w-3xl">
+                                    <h2 className="text-xl font-bold mb-2 flex items-center gap-2">
+                                        <i data-lucide="shield-check" className="text-indigo-300"></i> Planificateur de Stratégie
+                                    </h2>
+                                    <p className="text-sm text-indigo-100 leading-relaxed">
+                                        Pour vos positions <strong>spéculatives</strong>, fixez un <strong>Stop Loss</strong> (limiter la perte) et un <strong>Take Profit</strong> (empocher vos gains) <strong>avant</strong> l'achat.
+                                        Pour vos positions <strong>long terme</strong>, définissez un <strong>horizon cible</strong> (année de revente envisagée) et laissez la croissance composer.
+                                    </p>
+                                </div>
+                                <div className="absolute right-4 bottom-4 opacity-10 hidden md:block">
+                                    <i data-lucide="target" className="w-40 h-40"></i>
+                                </div>
+                            </div>
+
+                            {positions.length === 0 ? (
+                                <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-12 text-center text-slate-400">
+                                    <p className="text-sm">Vous n'avez pas de positions ouvertes à analyser.</p>
+                                    <p className="text-xs text-slate-400 mt-1">Achetez d'abord des actions pour configurer vos plans.</p>
+                                </div>
+                            ) : (
+                                <>
+                                    {/* Positions spéculatives */}
+                                    <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+                                        <div className="p-5 border-b border-slate-100">
+                                            <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                                                <i data-lucide="zap" className="text-indigo-600 w-5 h-5"></i> Poche Spéculation — Stop Loss & Take Profit
+                                            </h3>
+                                            <p className="text-xs text-slate-500">Configurez vos alertes spéculatives pour maîtriser vos sorties de position.</p>
+                                        </div>
+
+                                        {positions.filter(p => p.strategie === 'SPEC').length === 0 ? (
+                                            <div className="p-8 text-center text-slate-400 text-sm">Aucune position classée en Spéculation.</div>
+                                        ) : (
+                                            <div className="p-5 space-y-6">
+                                                {positions.filter(p => p.strategie === 'SPEC').map(pos => {
+                                                    const tgt = targets[pos.symbole] || { stopLoss: 0, takeProfit: 0 };
+                                                    const gainPotentiel = (tgt.takeProfit - pos.pru) * pos.quantite;
+                                                    const pertePotentielle = (pos.pru - tgt.stopLoss) * pos.quantite;
+                                                    const ratioRR = pertePotentielle > 0 ? (gainPotentiel / pertePotentielle).toFixed(1) : "N/A";
+                                                    const slFranchi = pos.coursActuel <= tgt.stopLoss && tgt.stopLoss > 0;
+                                                    const tpFranchi = pos.coursActuel >= tgt.takeProfit && tgt.takeProfit > 0;
+
+                                                    return (
+                                                        <div key={pos.symbole} className={`p-4 rounded-xl border transition-all ${slFranchi ? 'border-rose-400 bg-rose-50/10' : tpFranchi ? 'border-emerald-400 bg-emerald-50/10' : 'border-slate-200'}`}>
+                                                            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                                                                <div>
+                                                                    <div className="flex items-center gap-2">
+                                                                        <h4 className="text-lg font-black text-slate-900">{pos.symbole}</h4>
+                                                                        <span className="text-xs text-slate-500 font-medium">({pos.quantite} actions détenues)</span>
+                                                                    </div>
+                                                                    <p className="text-xs text-slate-400 mt-1">Prix moyen d'achat : <strong className="text-slate-700">{formatFCFA(pos.pru)}</strong> (cours actuel : {formatFCFA(pos.coursActuel)})</p>
+                                                                </div>
+                                                                <div className="flex flex-wrap gap-3">
+                                                                    <div>
+                                                                        <label className="block text-[11px] font-bold text-rose-600 mb-1 uppercase">Stop Loss (Sécurité)</label>
+                                                                        <div className="relative">
+                                                                            <input
+                                                                                type="number"
+                                                                                value={tgt.stopLoss || ""}
+                                                                                onChange={(e) => handleUpdateTargets(pos.symbole, "stopLoss", e.target.value)}
+                                                                                placeholder="ex: 1900"
+                                                                                className="w-28 pl-2 pr-8 py-1.5 text-xs font-bold border border-rose-200 rounded-lg focus:outline-none focus:border-rose-600"
+                                                                            />
+                                                                            <span className="absolute right-2.5 top-2 text-[9px] text-rose-400 font-bold">XOF</span>
+                                                                        </div>
+                                                                    </div>
+                                                                    <div>
+                                                                        <label className="block text-[11px] font-bold text-emerald-600 mb-1 uppercase">Take Profit (Cible)</label>
+                                                                        <div className="relative">
+                                                                            <input
+                                                                                type="number"
+                                                                                value={tgt.takeProfit || ""}
+                                                                                onChange={(e) => handleUpdateTargets(pos.symbole, "takeProfit", e.target.value)}
+                                                                                placeholder="ex: 2600"
+                                                                                className="w-28 pl-2 pr-8 py-1.5 text-xs font-bold border border-emerald-200 rounded-lg focus:outline-none focus:border-emerald-600"
+                                                                            />
+                                                                            <span className="absolute right-2.5 top-2 text-[9px] text-emerald-400 font-bold">XOF</span>
+                                                                        </div>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+
+                                                            <div className="mt-4 pt-3 border-t border-dashed border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                                                                <div className="flex flex-wrap gap-2">
+                                                                    {slFranchi && (
+                                                                        <span className="bg-rose-100 text-rose-700 px-2.5 py-1 rounded-full font-bold">
+                                                                            ALERTE STOP LOSS FRANCHI ! Couper la perte.
+                                                                        </span>
+                                                                    )}
+                                                                    {tpFranchi && (
+                                                                        <span className="bg-emerald-100 text-emerald-700 px-2.5 py-1 rounded-full font-bold">
+                                                                            ALERTE OBJECTIF ATTEINT ! Prendre les profits.
+                                                                        </span>
+                                                                    )}
+                                                                    {!slFranchi && !tpFranchi && (
+                                                                        <span className="bg-slate-100 text-slate-600 px-2.5 py-1 rounded-full font-medium">
+                                                                            Position en cours d'évaluation. Aucun seuil déclenché.
+                                                                        </span>
+                                                                    )}
+                                                                </div>
+                                                                {tgt.stopLoss > 0 && tgt.takeProfit > 0 && (
+                                                                    <div className="text-slate-500 font-medium">
+                                                                        Ratio gain/risque ciblé : <strong className="text-slate-800">{ratioRR} : 1</strong>
+                                                                        <span className="text-[10px] text-slate-400 ml-1">(idéalement &gt; 2)</span>
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {/* Positions long terme */}
+                                    <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+                                        <div className="p-5 border-b border-slate-100">
+                                            <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                                                <i data-lucide="line-chart" className="text-emerald-600 w-5 h-5"></i> Poche Long Terme — Horizons Cibles
+                                            </h3>
+                                            <p className="text-xs text-slate-500">Fixez l'année cible de revente et suivez l'accumulation de richesse.</p>
+                                        </div>
+
+                                        {positions.filter(p => p.strategie === 'LT').length === 0 ? (
+                                            <div className="p-8 text-center text-slate-400 text-sm">Aucune position classée en Long Terme.</div>
+                                        ) : (
+                                            <div className="overflow-x-auto">
+                                                <table className="w-full text-left text-xs border-collapse">
+                                                    <thead>
+                                                        <tr className="bg-slate-50 text-slate-400 font-bold uppercase border-b border-slate-100">
+                                                            <th className="px-5 py-3">Actif</th>
+                                                            <th className="px-5 py-3 text-center">Parts</th>
+                                                            <th className="px-5 py-3 text-right">Total Investi</th>
+                                                            <th className="px-5 py-3 text-right">Valeur Actuelle</th>
+                                                            <th className="px-5 py-3 text-right">Performance</th>
+                                                            <th className="px-5 py-3 text-center">Horizon Cible (année)</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody className="divide-y divide-slate-100 font-medium text-slate-700">
+                                                        {positions.filter(p => p.strategie === 'LT').map(pos => (
+                                                            <tr key={pos.symbole} className="hover:bg-slate-50/50">
+                                                                <td className="px-5 py-3 font-bold text-slate-900">{pos.symbole}</td>
+                                                                <td className="px-5 py-3 text-center">{pos.quantite}</td>
+                                                                <td className="px-5 py-3 text-right">{formatFCFA(pos.coutTotal)}</td>
+                                                                <td className="px-5 py-3 text-right font-semibold">{formatFCFA(pos.valeurActuelle)}</td>
+                                                                <td className="px-5 py-3 text-right">
+                                                                    <span className={`font-bold ${pos.plusValue >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                                                        {pos.plusValue >= 0 ? '+' : ''}{pos.performance.toFixed(2)}%
+                                                                    </span>
+                                                                    <div className="text-[10px] text-slate-400">{formatFCFA(pos.plusValue)}</div>
+                                                                </td>
+                                                                <td className="px-5 py-3 text-center">
+                                                                    <input
+                                                                        type="number"
+                                                                        value={horizons[pos.symbole] || ""}
+                                                                        onChange={(e) => handleUpdateHorizon(pos.symbole, e.target.value)}
+                                                                        placeholder="Année"
+                                                                        className="w-20 px-1.5 py-0.5 text-center text-slate-600 border border-slate-200 rounded focus:outline-none focus:border-emerald-600"
+                                                                    />
+                                                                </td>
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        )}
+                                    </div>
+                                </>
+                            )}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        if (typeof React === 'undefined' || typeof ReactDOM === 'undefined') {
+            document.getElementById('root').innerHTML =
+                '<div style="max-width:520px;margin:3rem auto;padding:1.5rem;border:1px solid #fecaca;background:#fff1f2;border-radius:12px;font-family:sans-serif;">' +
+                '<h2 style="color:#be123c;margin:0 0 .75rem;">Erreur de chargement</h2>' +
+                '<p style="color:#444;margin:0;">React n\'a pas pu se charger. Vérifiez votre connexion internet, puis relancez <strong>demarrer.bat</strong> et ouvrez <strong>http://localhost:8080/portefeuille.html</strong>.</p></div>';
+        } else {
+            const root = ReactDOM.createRoot(document.getElementById('root'));
+            root.render(<App />);
+            setTimeout(() => { if (typeof lucide !== 'undefined') lucide.createIcons(); }, 300);
+        }
+    </script>
+
+    <script>
+        // Service Worker uniquement via http(s) — pas en file://
+        if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+            window.addEventListener('load', function () {
+                navigator.serviceWorker.register('./sw.js').catch(function (err) {
+                    console.warn('Service Worker non enregistré :', err);
+                });
+            });
+        }
+
+        // Avertissement si ouverture directe du fichier HTML
+        if (location.protocol === 'file:') {
+            window.addEventListener('load', function () {
+                setTimeout(function () {
+                    if (!document.getElementById('root').children.length) return;
+                    var banner = document.createElement('div');
+                    banner.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#fef3c7;color:#92400e;padding:.75rem 1rem;text-align:center;font-size:13px;font-family:sans-serif;z-index:9999;border-top:1px solid #fcd34d;';
+                    banner.innerHTML = 'Pour un fonctionnement optimal, lancez <strong>demarrer.bat</strong> puis ouvrez <strong>http://localhost:8080/portefeuille.html</strong> dans Chrome.';
+                    document.body.appendChild(banner);
+                }, 500);
+            });
+        }
+    </script>
+</body>
+</html>

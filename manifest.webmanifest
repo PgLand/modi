@@ -1,0 +1,33 @@
+{
+  "name": "BRVM Gestion Unifiée",
+  "short_name": "BRVM",
+  "description": "Suivi de portefeuille BRVM — Spéculation et Long Terme",
+  "start_url": "./portefeuille.html?source=homescreen",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#4f46e5",
+  "orientation": "any",
+  "lang": "fr",
+  "categories": ["finance", "business"],
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-maskable.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
