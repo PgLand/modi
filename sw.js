@@ -1,6 +1,7 @@
-const CACHE_NAME = 'brvm-gestion-v3';
+const CACHE_NAME = 'brvm-gestion-v4';
 const APP_SHELL = [
-  './portefeuille.html',
+  './',
+  './index.html',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',

@@ -956,7 +956,7 @@
             document.getElementById('root').innerHTML =
                 '<div style="max-width:520px;margin:3rem auto;padding:1.5rem;border:1px solid #fecaca;background:#fff1f2;border-radius:12px;font-family:sans-serif;">' +
                 '<h2 style="color:#be123c;margin:0 0 .75rem;">Erreur de chargement</h2>' +
-                '<p style="color:#444;margin:0;">React n\'a pas pu se charger. Vérifiez votre connexion internet, puis relancez <strong>demarrer.bat</strong> et ouvrez <strong>http://localhost:8080/portefeuille.html</strong>.</p></div>';
+                '<p style="color:#444;margin:0;">React n\'a pas pu se charger. Vérifiez votre connexion internet, puis relancez <strong>demarrer.bat</strong> et ouvrez <strong>http://localhost:8080/</strong>.</p></div>';
         } else {
             const root = ReactDOM.createRoot(document.getElementById('root'));
             root.render(<App />);
@@ -981,7 +981,7 @@
                     if (!document.getElementById('root').children.length) return;
                     var banner = document.createElement('div');
                     banner.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#fef3c7;color:#92400e;padding:.75rem 1rem;text-align:center;font-size:13px;font-family:sans-serif;z-index:9999;border-top:1px solid #fcd34d;';
-                    banner.innerHTML = 'Pour un fonctionnement optimal, lancez <strong>demarrer.bat</strong> puis ouvrez <strong>http://localhost:8080/portefeuille.html</strong> dans Chrome.';
+                    banner.innerHTML = 'Pour un fonctionnement optimal, lancez <strong>demarrer.bat</strong> puis ouvrez <strong>http://localhost:8080/</strong> dans Chrome.';
                     document.body.appendChild(banner);
                 }, 500);
             });

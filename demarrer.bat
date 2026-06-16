@@ -16,7 +16,7 @@ echo  ========================================
 echo.
 echo  Sur telephone (meme WiFi), ouvrez Chrome et allez sur :
 for /f "tokens=2 delims=:" %%a in ('ipconfig ^| findstr /c:"IPv4"') do (
-    echo    http://%%a:8080/portefeuille.html
+    echo    http://%%a:8080/
     goto :ip_done
 )
 :ip_done
@@ -27,7 +27,7 @@ echo  Appuyez sur Ctrl+C pour arreter le serveur.
 echo  ========================================
 echo.
 
-start "" cmd /c "ping 127.0.0.1 -n 3 >nul && start http://localhost:8080/portefeuille.html"
+start "" cmd /c "ping 127.0.0.1 -n 3 >nul && start http://localhost:8080/"
 
 where py >nul 2>&1
 if %errorlevel%==0 (

@@ -2,7 +2,7 @@
   "name": "BRVM Gestion Unifiée",
   "short_name": "BRVM",
   "description": "Suivi de portefeuille BRVM — Spéculation et Long Terme",
-  "start_url": "./portefeuille.html?source=homescreen",
+  "start_url": "./",
   "scope": "./",
   "display": "standalone",
   "background_color": "#f8fafc",
