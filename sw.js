@@ -1,4 +1,4 @@
-const CACHE_NAME = 'brvm-gestion-v5';
+const CACHE_NAME = 'brvm-gestion-v6';
 const APP_SHELL = [
   './',
   './index.html',
@@ -24,13 +24,34 @@ self.addEventListener('activate', (event) => {
   self.clients.claim();
 });
 
+function isAppDocument(url) {
+  const p = url.pathname;
+  return p.endsWith('.html') || p.endsWith('/') || p.endsWith('/modi') || p.endsWith('/modi/');
+}
+
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
 
   const url = new URL(event.request.url);
 
-  // Fichiers locaux : cache d'abord, réseau en secours
   if (url.origin === self.location.origin) {
+    // HTML : réseau d'abord pour avoir la dernière version rapidement
+    if (isAppDocument(url) || url.pathname.endsWith('manifest.webmanifest') || url.pathname.endsWith('sw.js')) {
+      event.respondWith(
+        fetch(event.request)
+          .then((response) => {
+            if (response && response.ok) {
+              const clone = response.clone();
+              caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+            }
+            return response;
+          })
+          .catch(() => caches.match(event.request))
+      );
+      return;
+    }
+
+    // Icônes et autres fichiers locaux : cache d'abord
     event.respondWith(
       caches.match(event.request).then((cached) => {
         if (cached) return cached;
@@ -46,7 +67,6 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // CDN (React, Tailwind, etc.) : réseau d'abord, cache en secours
   if (
     url.hostname.includes('unpkg.com') ||
     url.hostname.includes('tailwindcss.com') ||

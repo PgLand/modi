@@ -103,11 +103,20 @@
                 loadState(KEYS.strategies, MIGRATED ? MIGRATED.strategies : {})
             );
 
-            useEffect(() => { localStorage.setItem(KEYS.transactions, JSON.stringify(transactions)); }, [transactions]);
-            useEffect(() => { localStorage.setItem(KEYS.marketPrices, JSON.stringify(marketPrices)); }, [marketPrices]);
-            useEffect(() => { localStorage.setItem(KEYS.horizons, JSON.stringify(horizons)); }, [horizons]);
-            useEffect(() => { localStorage.setItem(KEYS.targets, JSON.stringify(targets)); }, [targets]);
-            useEffect(() => { localStorage.setItem(KEYS.strategies, JSON.stringify(strategies)); }, [strategies]);
+            useEffect(() => {
+                const timer = setTimeout(() => {
+                    try {
+                        localStorage.setItem(KEYS.transactions, JSON.stringify(transactions));
+                        localStorage.setItem(KEYS.marketPrices, JSON.stringify(marketPrices));
+                        localStorage.setItem(KEYS.horizons, JSON.stringify(horizons));
+                        localStorage.setItem(KEYS.targets, JSON.stringify(targets));
+                        localStorage.setItem(KEYS.strategies, JSON.stringify(strategies));
+                    } catch (e) {
+                        console.warn('Sauvegarde locale impossible', e);
+                    }
+                }, 400);
+                return () => clearTimeout(timer);
+            }, [transactions, marketPrices, horizons, targets, strategies]);
 
             // États de navigation et de formulaire
             const [activeTab, setActiveTab] = useState("dashboard"); // dashboard, transactions, strategie
@@ -120,6 +129,10 @@
             const [fluxMontant, setFluxMontant] = useState("");
             const [fraisManuels, setFraisManuels] = useState("");
             const [filtrePoche, setFiltrePoche] = useState("TOUS"); // TOUS, SPEC, LT
+            const [priceDrafts, setPriceDrafts] = useState({});
+            const [editingTxId, setEditingTxId] = useState(null);
+            const [editForm, setEditForm] = useState(null);
+            const [isSaving, setIsSaving] = useState(false);
             const [installPrompt, setInstallPrompt] = useState(null);
             const [canInstall, setCanInstall] = useState(false);
             const [showInstallGuide, setShowInstallGuide] = useState(false);
@@ -172,13 +185,12 @@
                 };
             }, []);
 
-            // Convertit les icônes Lucide après changement d'écran (évite les boucles infinies)
             useEffect(() => {
                 const timer = setTimeout(() => {
                     if (typeof lucide !== 'undefined') lucide.createIcons();
-                }, 50);
+                }, 80);
                 return () => clearTimeout(timer);
-            }, [activeTab, transactions.length, canInstall, isInstalled, filtrePoche, showInstallGuide]);
+            }, [activeTab, showInstallGuide, editingTxId]);
 
             // Capture l'événement d'installation PWA proposé par Chrome
             useEffect(() => {
@@ -218,17 +230,53 @@
             const formatFCFA = (val) =>
                 new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'XOF', minimumFractionDigits: 0 }).format(val).replace('XOF', 'FCFA');
 
-            // Trésorerie commune aux deux poches
-            const cashDisponible = useMemo(() => {
+            const calcCash = (txList, excludeId) => {
                 let solde = 0;
-                transactions.forEach(t => {
+                txList.forEach(t => {
+                    if (excludeId && t.id === excludeId) return;
                     if (t.type === "DEPOT") solde += t.credit;
                     else if (t.type === "RETRAIT") solde -= t.debit;
                     else if (t.type === "ACHAT") solde -= t.debit;
                     else if (t.type === "VENTE") solde += t.credit;
                 });
                 return solde;
-            }, [transactions]);
+            };
+
+            const buildTx = (type, data) => {
+                if (type === "DEPOT" || type === "RETRAIT") {
+                    const mt = parseFloat(data.fluxMontant);
+                    if (isNaN(mt) || mt <= 0) return null;
+                    return {
+                        date: data.dateOp,
+                        type,
+                        libelle: type === "DEPOT" ? "Apport de capital" : "Retrait de fonds",
+                        montant: mt,
+                        debit: type === "RETRAIT" ? mt : 0,
+                        credit: type === "DEPOT" ? mt : 0
+                    };
+                }
+                const qty = parseInt(data.quantite);
+                const price = parseFloat(data.cours);
+                const sym = data.ticker.toUpperCase().trim();
+                if (!sym || isNaN(qty) || qty <= 0 || isNaN(price) || price <= 0) return null;
+                const totalBrut = qty * price;
+                const frais = data.fraisManuels ? parseFloat(data.fraisManuels) : Math.round(totalBrut * 0.0122);
+                let debit = 0, credit = 0;
+                if (type === "ACHAT") debit = totalBrut + frais;
+                else credit = totalBrut - frais;
+                return {
+                    date: data.dateOp,
+                    type,
+                    libelle: sym,
+                    poche: data.poche || 'SPEC',
+                    quantite: qty,
+                    cours: price,
+                    debit,
+                    credit
+                };
+            };
+
+            const cashDisponible = useMemo(() => calcCash(transactions), [transactions]);
 
             // Positions consolidées (PRU frais inclus), toutes poches confondues
             const positions = useMemo(() => {
@@ -299,70 +347,88 @@
                 return res;
             }, [positions]);
 
-            // Enregistrement d'un mouvement
             const handleAddTransaction = (e) => {
                 e.preventDefault();
-                const id = Date.now().toString();
+                setIsSaving(true);
+                const built = buildTx(formType, { fluxMontant, dateOp, quantite, cours, ticker, fraisManuels, poche: formPoche });
+                if (!built) { setIsSaving(false); return; }
 
-                if (formType === "DEPOT" || formType === "RETRAIT") {
-                    const mt = parseFloat(fluxMontant);
-                    if (isNaN(mt) || mt <= 0) return;
-
-                    setTransactions([{
-                        id, date: dateOp, type: formType,
-                        libelle: formType === "DEPOT" ? "Apport de capital" : "Retrait de fonds",
-                        montant: mt,
-                        debit: formType === "RETRAIT" ? mt : 0,
-                        credit: formType === "DEPOT" ? mt : 0
-                    }, ...transactions]);
-                    setFluxMontant("");
-                } else {
-                    const qty = parseInt(quantite);
-                    const price = parseFloat(cours);
-                    const sym = ticker.toUpperCase().trim();
-                    if (!sym || isNaN(qty) || qty <= 0 || isNaN(price) || price <= 0) return;
-
-                    const totalBrut = qty * price;
-                    // Frais de courtage estimés à ~1,22% si non renseignés
-                    const frais = fraisManuels ? parseFloat(fraisManuels) : Math.round(totalBrut * 0.0122);
-
-                    let debit = 0, credit = 0;
-                    if (formType === "ACHAT") {
-                        debit = totalBrut + frais;
-                        if (debit > cashDisponible) {
-                            alert("Trésorerie insuffisante pour exécuter cet achat !");
-                            return;
-                        }
-                    } else {
-                        credit = totalBrut - frais;
+                if (formType === "ACHAT") {
+                    if (built.debit > cashDisponible) {
+                        alert("Trésorerie insuffisante pour exécuter cet achat !");
+                        setIsSaving(false);
+                        return;
                     }
-
-                    if (!marketPrices[sym]) setMarketPrices({ ...marketPrices, [sym]: price });
-                    if (formType === "ACHAT") {
-                        if (!strategies[sym]) setStrategies({ ...strategies, [sym]: formPoche });
-                        if (formPoche === "LT" && !horizons[sym]) {
-                            setHorizons({ ...horizons, [sym]: new Date().getFullYear() + 5 });
-                        }
+                    if (!marketPrices[built.libelle]) {
+                        setMarketPrices(prev => ({ ...prev, [built.libelle]: built.cours }));
                     }
-
-                    setTransactions([{
-                        id, date: dateOp, type: formType, libelle: sym,
-                        poche: strategies[sym] || formPoche,
-                        quantite: qty, cours: price, debit, credit
-                    }, ...transactions]);
-                    setTicker(""); setQuantite(""); setCours(""); setFraisManuels("");
+                    if (!strategies[built.libelle]) {
+                        setStrategies(prev => ({ ...prev, [built.libelle]: formPoche }));
+                    }
+                    if (formPoche === "LT" && !horizons[built.libelle]) {
+                        setHorizons(prev => ({ ...prev, [built.libelle]: new Date().getFullYear() + 5 }));
+                    }
                 }
+
+                setTransactions(prev => [{ id: Date.now().toString(), ...built }, ...prev]);
+                setFluxMontant(""); setTicker(""); setQuantite(""); setCours(""); setFraisManuels("");
+                setTimeout(() => setIsSaving(false), 150);
             };
 
             const handleDeleteTransaction = (id) => {
                 if (confirm("Voulez-vous vraiment supprimer cette ligne de transaction ?")) {
-                    setTransactions(transactions.filter(t => t.id !== id));
+                    setTransactions(prev => prev.filter(t => t.id !== id));
                 }
             };
 
-            const handleUpdateMarketPrice = (sym, val) => {
-                const p = parseFloat(val);
-                if (!isNaN(p)) setMarketPrices({ ...marketPrices, [sym]: p });
+            const handleOpenEdit = (t) => {
+                setEditingTxId(t.id);
+                setEditForm({
+                    type: t.type,
+                    dateOp: t.date,
+                    fluxMontant: t.type === 'DEPOT' || t.type === 'RETRAIT' ? String(t.credit || t.debit || t.montant || '') : '',
+                    ticker: (t.type === 'ACHAT' || t.type === 'VENTE') ? t.libelle : '',
+                    quantite: t.quantite ? String(t.quantite) : '',
+                    cours: t.cours ? String(t.cours) : '',
+                    fraisManuels: '',
+                    poche: t.poche || strategies[t.libelle] || 'SPEC'
+                });
+            };
+
+            const handleSaveEdit = (e) => {
+                e.preventDefault();
+                if (!editingTxId || !editForm) return;
+                const built = buildTx(editForm.type, editForm);
+                if (!built) return;
+
+                if (editForm.type === "ACHAT") {
+                    const cashDispo = calcCash(transactions, editingTxId);
+                    if (built.debit > cashDispo) {
+                        alert("Trésorerie insuffisante pour cet achat modifié !");
+                        return;
+                    }
+                    setStrategies(prev => ({ ...prev, [built.libelle]: editForm.poche || prev[built.libelle] || 'SPEC' }));
+                }
+
+                setTransactions(prev => prev.map(t => t.id === editingTxId ? { ...built, id: t.id } : t));
+                setEditingTxId(null);
+                setEditForm(null);
+            };
+
+            const handleUpdateMarketPriceDraft = (sym, val) => {
+                setPriceDrafts(prev => ({ ...prev, [sym]: val }));
+            };
+
+            const commitMarketPrice = (sym) => {
+                const raw = priceDrafts[sym];
+                if (raw === undefined) return;
+                const p = parseFloat(raw);
+                if (!isNaN(p)) setMarketPrices(prev => ({ ...prev, [sym]: p }));
+                setPriceDrafts(prev => {
+                    const next = { ...prev };
+                    delete next[sym];
+                    return next;
+                });
             };
 
             const handleUpdateHorizon = (sym, val) => setHorizons({ ...horizons, [sym]: val });
@@ -618,8 +684,8 @@
                                             </div>
                                         )}
 
-                                        <button type="submit" className={`w-full py-2 px-4 text-white text-sm font-bold rounded-lg transition-colors ${formType === 'ACHAT' ? 'bg-emerald-600 hover:bg-emerald-700' : formType === 'VENTE' ? 'bg-amber-600 hover:bg-amber-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}>
-                                            Enregistrer dans le Journal
+                                        <button type="submit" disabled={isSaving} className={`w-full py-2 px-4 text-white text-sm font-bold rounded-lg transition-colors disabled:opacity-60 ${formType === 'ACHAT' ? 'bg-emerald-600 hover:bg-emerald-700' : formType === 'VENTE' ? 'bg-amber-600 hover:bg-amber-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}>
+                                            {isSaving ? 'Enregistrement…' : 'Enregistrer dans le Journal'}
                                         </button>
                                     </form>
                                 </div>
@@ -672,8 +738,10 @@
                                                                 <div className="flex items-center justify-end gap-1.5">
                                                                     <input
                                                                         type="number"
-                                                                        value={pos.coursActuel}
-                                                                        onChange={(e) => handleUpdateMarketPrice(pos.symbole, e.target.value)}
+                                                                        value={priceDrafts[pos.symbole] ?? pos.coursActuel}
+                                                                        onChange={(e) => handleUpdateMarketPriceDraft(pos.symbole, e.target.value)}
+                                                                        onBlur={() => commitMarketPrice(pos.symbole)}
+                                                                        onKeyDown={(e) => e.key === 'Enter' && commitMarketPrice(pos.symbole)}
                                                                         className="w-20 px-1.5 py-0.5 text-right font-bold border border-slate-200 rounded bg-slate-50 focus:outline-none focus:border-indigo-600"
                                                                     />
                                                                     <span className="text-[10px] text-slate-400">XOF</span>
@@ -710,7 +778,7 @@
                         <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
                             <div className="p-5 border-b border-slate-100">
                                 <h2 className="text-base font-bold text-slate-900">Historique des mouvements de fonds & d'actions</h2>
-                                <p className="text-xs text-slate-500">Toutes les opérations (poches Spéculation et Long Terme confondues), par ordre chronologique décroissant.</p>
+                                <p className="text-xs text-slate-500">Cliquez sur le crayon pour modifier une ligne, ou sur la corbeille pour la supprimer.</p>
                             </div>
                             <div className="overflow-x-auto">
                                 <table className="w-full text-left text-xs border-collapse">
@@ -759,14 +827,82 @@
                                                 <td className="px-5 py-3 text-right font-semibold text-rose-600">{t.debit > 0 ? formatFCFA(t.debit) : "-"}</td>
                                                 <td className="px-5 py-3 text-right font-semibold text-emerald-600">{t.credit > 0 ? formatFCFA(t.credit) : "-"}</td>
                                                 <td className="px-5 py-3 text-center">
-                                                    <button onClick={() => handleDeleteTransaction(t.id)} className="text-slate-300 hover:text-rose-600 p-1 rounded-md hover:bg-slate-100 transition" title="Supprimer la transaction">
-                                                        <i data-lucide="trash-2" className="w-4 h-4 mx-auto"></i>
-                                                    </button>
+                                                    <div className="flex items-center justify-center gap-1">
+                                                        <button onClick={() => handleOpenEdit(t)} className="text-slate-400 hover:text-indigo-600 p-1 rounded-md hover:bg-slate-100 transition" title="Modifier la transaction">
+                                                            <i data-lucide="pencil" className="w-4 h-4"></i>
+                                                        </button>
+                                                        <button onClick={() => handleDeleteTransaction(t.id)} className="text-slate-300 hover:text-rose-600 p-1 rounded-md hover:bg-slate-100 transition" title="Supprimer la transaction">
+                                                            <i data-lucide="trash-2" className="w-4 h-4"></i>
+                                                        </button>
+                                                    </div>
                                                 </td>
                                             </tr>
                                         ))}
                                     </tbody>
                                 </table>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Modal modification transaction */}
+                    {editingTxId && editForm && (
+                        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4 bg-slate-900/50" onClick={() => { setEditingTxId(null); setEditForm(null); }}>
+                            <div className="bg-white rounded-2xl shadow-xl max-w-md w-full p-6 border border-slate-200 max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+                                <div className="flex items-start justify-between gap-3 mb-4">
+                                    <h2 className="text-lg font-black text-slate-900">Modifier l'opération</h2>
+                                    <button onClick={() => { setEditingTxId(null); setEditForm(null); }} className="text-slate-400 hover:text-slate-700 p-1">
+                                        <i data-lucide="x" className="w-5 h-5"></i>
+                                    </button>
+                                </div>
+                                <form onSubmit={handleSaveEdit} className="space-y-3">
+                                    <div>
+                                        <label className="block text-[11px] font-bold text-slate-500 mb-1">Type</label>
+                                        <div className="px-3 py-2 text-sm font-bold bg-slate-100 rounded-lg text-slate-700">{editForm.type}</div>
+                                    </div>
+                                    <div>
+                                        <label className="block text-[11px] font-bold text-slate-500 mb-1">Date</label>
+                                        <input type="date" value={editForm.dateOp} onChange={(e) => setEditForm({ ...editForm, dateOp: e.target.value })} className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg" required />
+                                    </div>
+                                    {(editForm.type === 'ACHAT' || editForm.type === 'VENTE') ? (
+                                        <>
+                                            <div>
+                                                <label className="block text-[11px] font-bold text-slate-500 mb-1">Symbole</label>
+                                                <input type="text" value={editForm.ticker} onChange={(e) => setEditForm({ ...editForm, ticker: e.target.value })} className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg font-bold uppercase" required />
+                                            </div>
+                                            <div className="grid grid-cols-2 gap-2">
+                                                <div>
+                                                    <label className="block text-[11px] font-bold text-slate-500 mb-1">Quantité</label>
+                                                    <input type="number" value={editForm.quantite} onChange={(e) => setEditForm({ ...editForm, quantite: e.target.value })} className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg" required />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-[11px] font-bold text-slate-500 mb-1">Cours (XOF)</label>
+                                                    <input type="number" value={editForm.cours} onChange={(e) => setEditForm({ ...editForm, cours: e.target.value })} className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg" required />
+                                                </div>
+                                            </div>
+                                            {editForm.type === 'ACHAT' && (
+                                                <div>
+                                                    <label className="block text-[11px] font-bold text-slate-500 mb-1">Poche</label>
+                                                    <div className="grid grid-cols-2 gap-1 bg-slate-100 p-1 rounded-lg text-xs font-bold">
+                                                        <button type="button" onClick={() => setEditForm({ ...editForm, poche: 'SPEC' })} className={`py-1.5 rounded-md ${editForm.poche === 'SPEC' ? 'bg-white shadow text-indigo-600' : 'text-slate-400'}`}>Spéculation</button>
+                                                        <button type="button" onClick={() => setEditForm({ ...editForm, poche: 'LT' })} className={`py-1.5 rounded-md ${editForm.poche === 'LT' ? 'bg-white shadow text-emerald-600' : 'text-slate-400'}`}>Long Terme</button>
+                                                    </div>
+                                                </div>
+                                            )}
+                                            <div>
+                                                <label className="block text-[11px] font-bold text-slate-500 mb-1">Frais (facultatif, ~1.22% si vide)</label>
+                                                <input type="number" value={editForm.fraisManuels} onChange={(e) => setEditForm({ ...editForm, fraisManuels: e.target.value })} placeholder="Laisser vide pour recalcul" className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg" />
+                                            </div>
+                                        </>
+                                    ) : (
+                                        <div>
+                                            <label className="block text-[11px] font-bold text-slate-500 mb-1">Montant (FCFA)</label>
+                                            <input type="number" value={editForm.fluxMontant} onChange={(e) => setEditForm({ ...editForm, fluxMontant: e.target.value })} className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg font-bold" required />
+                                        </div>
+                                    )}
+                                    <button type="submit" className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-bold rounded-lg mt-2">
+                                        Enregistrer les modifications
+                                    </button>
+                                </form>
                             </div>
                         </div>
                     )}
