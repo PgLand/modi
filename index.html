@@ -88,6 +88,28 @@
             return safeParse(localStorage.getItem(key), fallback);
         }
 
+        const FRAIS_TAUX_DEFAUT = 0.0122;
+
+        function calcFraisOperation(type, qty, price, fraisManuelsStr) {
+            const q = parseInt(qty);
+            const p = parseFloat(price);
+            if (isNaN(q) || q <= 0 || isNaN(p) || p <= 0) return null;
+            const totalBrut = q * p;
+            const fraisSaisi = fraisManuelsStr !== '' && fraisManuelsStr != null && !isNaN(parseFloat(fraisManuelsStr));
+            const frais = fraisSaisi ? parseFloat(fraisManuelsStr) : Math.round(totalBrut * FRAIS_TAUX_DEFAUT);
+            const pct = totalBrut > 0 ? (frais / totalBrut) * 100 : 0;
+            const totalNet = type === 'ACHAT' ? totalBrut + frais : totalBrut - frais;
+            return { totalBrut, frais, pct, totalNet, estime: !fraisSaisi };
+        }
+
+        function getTxFrais(t) {
+            if (t.type !== 'ACHAT' && t.type !== 'VENTE') return null;
+            const brut = t.montantBrut || (t.quantite * t.cours);
+            if (t.frais != null) return { brut, frais: t.frais, pct: t.fraisPct != null ? t.fraisPct : (brut > 0 ? (t.frais / brut) * 100 : 0) };
+            const frais = t.type === 'ACHAT' ? t.debit - brut : brut - t.credit;
+            return { brut, frais: Math.max(0, frais), pct: brut > 0 ? (Math.max(0, frais) / brut) * 100 : 0 };
+        }
+
         function App() {
             const [transactions, setTransactions] = useState(() =>
                 loadState(KEYS.transactions, MIGRATED ? MIGRATED.transactions : [])
@@ -238,6 +260,7 @@
                     else if (t.type === "RETRAIT") solde -= t.debit;
                     else if (t.type === "ACHAT") solde -= t.debit;
                     else if (t.type === "VENTE") solde += t.credit;
+                    else if (t.type === "DIVIDENDE") solde += t.credit;
                 });
                 return solde;
             };
@@ -255,12 +278,35 @@
                         credit: type === "DEPOT" ? mt : 0
                     };
                 }
+                if (type === "DIVIDENDE") {
+                    const sym = data.ticker.toUpperCase().trim();
+                    if (!sym) return null;
+                    const qty = parseInt(data.quantite);
+                    const divPerShare = parseFloat(data.cours);
+                    let mt = parseFloat(data.fluxMontant);
+                    if (isNaN(mt) || mt <= 0) {
+                        if (isNaN(qty) || qty <= 0 || isNaN(divPerShare) || divPerShare <= 0) return null;
+                        mt = Math.round(qty * divPerShare);
+                    }
+                    return {
+                        date: data.dateOp,
+                        type: "DIVIDENDE",
+                        libelle: sym,
+                        quantite: !isNaN(qty) && qty > 0 ? qty : undefined,
+                        cours: !isNaN(divPerShare) && divPerShare > 0 ? divPerShare : undefined,
+                        montant: mt,
+                        credit: mt,
+                        debit: 0
+                    };
+                }
                 const qty = parseInt(data.quantite);
                 const price = parseFloat(data.cours);
                 const sym = data.ticker.toUpperCase().trim();
                 if (!sym || isNaN(qty) || qty <= 0 || isNaN(price) || price <= 0) return null;
                 const totalBrut = qty * price;
-                const frais = data.fraisManuels ? parseFloat(data.fraisManuels) : Math.round(totalBrut * 0.0122);
+                const fraisSaisi = data.fraisManuels !== '' && data.fraisManuels != null && !isNaN(parseFloat(data.fraisManuels));
+                const frais = fraisSaisi ? parseFloat(data.fraisManuels) : Math.round(totalBrut * FRAIS_TAUX_DEFAUT);
+                const fraisPct = totalBrut > 0 ? (frais / totalBrut) * 100 : 0;
                 let debit = 0, credit = 0;
                 if (type === "ACHAT") debit = totalBrut + frais;
                 else credit = totalBrut - frais;
@@ -271,6 +317,9 @@
                     poche: data.poche || 'SPEC',
                     quantite: qty,
                     cours: price,
+                    montantBrut: totalBrut,
+                    frais,
+                    fraisPct,
                     debit,
                     credit
                 };
@@ -347,6 +396,53 @@
                 return res;
             }, [positions]);
 
+            const dividendesStats = useMemo(() => {
+                const parAction = {};
+                let total = 0;
+                transactions.forEach(t => {
+                    if (t.type === "DIVIDENDE") {
+                        total += t.credit || 0;
+                        parAction[t.libelle] = (parAction[t.libelle] || 0) + (t.credit || 0);
+                    }
+                });
+                return { total, parAction };
+            }, [transactions]);
+
+            const fraisStats = useMemo(() => {
+                let totalFrais = 0;
+                let volumeBrut = 0;
+                transactions.forEach(t => {
+                    const info = getTxFrais(t);
+                    if (info) {
+                        totalFrais += info.frais;
+                        volumeBrut += info.brut;
+                    }
+                });
+                return {
+                    totalFrais,
+                    volumeBrut,
+                    pctMoyen: volumeBrut > 0 ? (totalFrais / volumeBrut) * 100 : 0,
+                    nbOperations: transactions.filter(t => t.type === 'ACHAT' || t.type === 'VENTE').length
+                };
+            }, [transactions]);
+
+            const apercuFraisForm = useMemo(() => {
+                if (formType !== 'ACHAT' && formType !== 'VENTE') return null;
+                return calcFraisOperation(formType, quantite, cours, fraisManuels);
+            }, [formType, quantite, cours, fraisManuels]);
+
+            const apercuFraisEdit = useMemo(() => {
+                if (!editForm || (editForm.type !== 'ACHAT' && editForm.type !== 'VENTE')) return null;
+                return calcFraisOperation(editForm.type, editForm.quantite, editForm.cours, editForm.fraisManuels);
+            }, [editForm]);
+
+            const fillDividendeQuantite = () => {
+                const sym = ticker.toUpperCase().trim();
+                if (!sym) return;
+                const pos = positions.find(p => p.symbole === sym);
+                if (pos) setQuantite(String(pos.quantite));
+            };
+
             const handleAddTransaction = (e) => {
                 e.preventDefault();
                 setIsSaving(true);
@@ -386,11 +482,11 @@
                 setEditForm({
                     type: t.type,
                     dateOp: t.date,
-                    fluxMontant: t.type === 'DEPOT' || t.type === 'RETRAIT' ? String(t.credit || t.debit || t.montant || '') : '',
-                    ticker: (t.type === 'ACHAT' || t.type === 'VENTE') ? t.libelle : '',
+                    fluxMontant: (t.type === 'DEPOT' || t.type === 'RETRAIT' || t.type === 'DIVIDENDE') ? String(t.credit || t.debit || t.montant || '') : '',
+                    ticker: (t.type === 'ACHAT' || t.type === 'VENTE' || t.type === 'DIVIDENDE') ? t.libelle : '',
                     quantite: t.quantite ? String(t.quantite) : '',
                     cours: t.cours ? String(t.cours) : '',
-                    fraisManuels: '',
+                    fraisManuels: t.frais != null ? String(t.frais) : '',
                     poche: t.poche || strategies[t.libelle] || 'SPEC'
                 });
             };
@@ -469,6 +565,27 @@
                     {strategie === 'SPEC' ? 'Spéculation' : 'Long Terme'}
                 </button>
             );
+
+            const FraisApercu = ({ apercu, type }) => {
+                if (!apercu) return null;
+                return (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50/60 p-3 text-xs space-y-1.5">
+                        <div className="font-bold text-amber-800 uppercase tracking-wide text-[10px]">Détail des frais (avant enregistrement)</div>
+                        <div className="flex justify-between gap-2">
+                            <span className="text-slate-600">Montant brut</span>
+                            <span className="font-bold text-slate-800">{formatFCFA(apercu.totalBrut)}</span>
+                        </div>
+                        <div className="flex justify-between gap-2 text-amber-900">
+                            <span>Frais courtier{apercu.estime ? ' (estimé ~1,22%)' : ''}</span>
+                            <span className="font-bold">{formatFCFA(apercu.frais)} · {apercu.pct.toFixed(2)}%</span>
+                        </div>
+                        <div className="flex justify-between gap-2 border-t border-amber-200 pt-1.5">
+                            <span className="font-bold text-slate-800">{type === 'ACHAT' ? 'Total à débiter' : 'Total à créditer'}</span>
+                            <span className="font-black text-slate-900">{formatFCFA(apercu.totalNet)}</span>
+                        </div>
+                    </div>
+                );
+            };
 
             return (
                 <div className="max-w-7xl mx-auto px-4 py-6 md:py-10">
@@ -564,7 +681,7 @@
                         <div className="space-y-6">
 
                             {/* Chiffres clés */}
-                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
                                 <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
                                     <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Patrimoine Total</span>
                                     <h3 className="text-2xl font-black text-slate-900 mt-1">{formatFCFA(valeurTotale)}</h3>
@@ -591,7 +708,35 @@
                                         {totalLatent >= 0 ? 'Hausse' : 'Baisse'} de {latentPct.toFixed(2)}% sur vos actifs
                                     </span>
                                 </div>
+                                <div className="bg-white p-5 rounded-xl border border-violet-100 bg-violet-50/20 shadow-sm">
+                                    <span className="text-xs font-bold text-violet-600 uppercase tracking-wider">Dividendes Perçus</span>
+                                    <h3 className="text-2xl font-black text-violet-700 mt-1">{formatFCFA(dividendesStats.total)}</h3>
+                                    <p className="text-xs text-slate-400 mt-1">Revenus versés par vos actions</p>
+                                </div>
+                                <div className="bg-white p-5 rounded-xl border border-amber-100 bg-amber-50/20 shadow-sm">
+                                    <span className="text-xs font-bold text-amber-700 uppercase tracking-wider">Frais Courtier</span>
+                                    <h3 className="text-2xl font-black text-amber-800 mt-1">{formatFCFA(fraisStats.totalFrais)}</h3>
+                                    <span className="text-xs font-bold text-amber-700">{fraisStats.pctMoyen.toFixed(2)}% du volume brut</span>
+                                    <p className="text-xs text-slate-400 mt-1">{fraisStats.nbOperations} opération(s) achat/vente</p>
+                                </div>
                             </div>
+
+                            {/* Dividendes par action */}
+                            {Object.keys(dividendesStats.parAction).length > 0 && (
+                                <div className="bg-white p-4 rounded-xl border border-violet-100 shadow-sm">
+                                    <h3 className="text-sm font-bold text-slate-900 mb-3 flex items-center gap-2">
+                                        <i data-lucide="coins" className="text-violet-600 w-4 h-4"></i> Dividendes par action
+                                    </h3>
+                                    <div className="flex flex-wrap gap-2">
+                                        {Object.entries(dividendesStats.parAction).sort((a, b) => b[1] - a[1]).map(([sym, mt]) => (
+                                            <span key={sym} className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-violet-50 border border-violet-100 text-xs font-bold">
+                                                <span className="text-slate-800">{sym}</span>
+                                                <span className="text-violet-700">{formatFCFA(mt)}</span>
+                                            </span>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
 
                             {/* Répartition par poche */}
                             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -620,8 +765,8 @@
                                         <i data-lucide="plus-circle" className="text-indigo-600 w-5 h-5"></i> Enregistrer un mouvement
                                     </h2>
                                     <form onSubmit={handleAddTransaction} className="space-y-4">
-                                        <div className="grid grid-cols-2 gap-1 bg-slate-100 p-1 rounded-lg text-xs font-bold">
-                                            {["ACHAT", "VENTE", "DEPOT", "RETRAIT"].map(t => (
+                                        <div className="grid grid-cols-3 gap-1 bg-slate-100 p-1 rounded-lg text-xs font-bold">
+                                            {["ACHAT", "VENTE", "DEPOT", "RETRAIT", "DIVIDENDE"].map(t => (
                                                 <button key={t} type="button" onClick={() => setFormType(t)} className={`py-1.5 rounded-md transition-all ${formType === t ? 'bg-white shadow text-indigo-600' : 'text-slate-400 hover:text-slate-600'}`}>
                                                     {t}
                                                 </button>
@@ -666,9 +811,40 @@
                                                 <div>
                                                     <label className="block text-[11px] font-bold text-slate-500 mb-1 flex justify-between">
                                                         <span>Frais de courtage (Facultatif)</span>
-                                                        <span className="text-[10px] text-indigo-500 font-normal">~1.22% si vide</span>
+                                                        <span className="text-[10px] text-amber-600 font-normal">Défaut : {(FRAIS_TAUX_DEFAUT * 100).toFixed(2)}%</span>
                                                     </label>
-                                                    <input type="number" value={fraisManuels} onChange={(e) => setFraisManuels(e.target.value)} placeholder="Laisser vide pour estimation" className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg text-slate-500 focus:outline-none focus:border-indigo-600" />
+                                                    <input type="number" value={fraisManuels} onChange={(e) => setFraisManuels(e.target.value)} placeholder="Laisser vide pour estimation auto" className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg text-slate-500 focus:outline-none focus:border-indigo-600" />
+                                                </div>
+                                                <FraisApercu apercu={apercuFraisForm} type={formType} />
+                                            </>
+                                        ) : formType === "DIVIDENDE" ? (
+                                            <>
+                                                <div className="grid grid-cols-3 gap-2">
+                                                    <div className="col-span-2">
+                                                        <label className="block text-[11px] font-bold text-slate-500 mb-1">Action (ex: FTSC)</label>
+                                                        <input type="text" value={ticker} onChange={(e) => setTicker(e.target.value)} onBlur={fillDividendeQuantite} placeholder="ex: BOAS" className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg font-bold uppercase focus:outline-none focus:border-violet-600" required />
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-[11px] font-bold text-slate-500 mb-1">Date de versement</label>
+                                                        <input type="date" value={dateOp} onChange={(e) => setDateOp(e.target.value)} className="w-full px-2 py-1.5 text-xs border border-slate-200 rounded-lg focus:outline-none focus:border-violet-600" required />
+                                                    </div>
+                                                </div>
+                                                <div className="grid grid-cols-2 gap-2">
+                                                    <div>
+                                                        <label className="block text-[11px] font-bold text-slate-500 mb-1">Nombre d'actions</label>
+                                                        <input type="number" value={quantite} onChange={(e) => setQuantite(e.target.value)} placeholder="Parts détenues" className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-violet-600" />
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-[11px] font-bold text-slate-500 mb-1">Dividende / action (XOF)</label>
+                                                        <input type="number" value={cours} onChange={(e) => setCours(e.target.value)} placeholder="ex: 150" className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg focus:outline-none focus:border-violet-600" />
+                                                    </div>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-[11px] font-bold text-slate-500 mb-1 flex justify-between">
+                                                        <span>Montant net reçu (FCFA)</span>
+                                                        <span className="text-[10px] text-violet-500 font-normal">Ou laissez vide : Qté × Div/action</span>
+                                                    </label>
+                                                    <input type="number" value={fluxMontant} onChange={(e) => setFluxMontant(e.target.value)} placeholder="Montant crédité sur votre compte" className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg font-bold focus:outline-none focus:border-violet-600" />
                                                 </div>
                                             </>
                                         ) : (
@@ -684,7 +860,7 @@
                                             </div>
                                         )}
 
-                                        <button type="submit" disabled={isSaving} className={`w-full py-2 px-4 text-white text-sm font-bold rounded-lg transition-colors disabled:opacity-60 ${formType === 'ACHAT' ? 'bg-emerald-600 hover:bg-emerald-700' : formType === 'VENTE' ? 'bg-amber-600 hover:bg-amber-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}>
+                                        <button type="submit" disabled={isSaving} className={`w-full py-2 px-4 text-white text-sm font-bold rounded-lg transition-colors disabled:opacity-60 ${formType === 'ACHAT' ? 'bg-emerald-600 hover:bg-emerald-700' : formType === 'VENTE' ? 'bg-amber-600 hover:bg-amber-700' : formType === 'DIVIDENDE' ? 'bg-violet-600 hover:bg-violet-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}>
                                             {isSaving ? 'Enregistrement…' : 'Enregistrer dans le Journal'}
                                         </button>
                                     </form>
@@ -723,6 +899,7 @@
                                                         <th className="py-2 text-right">Cours Actuel</th>
                                                         <th className="py-2 text-right">Valeur Actuelle</th>
                                                         <th className="py-2 text-right">Plus/Moins-Value</th>
+                                                        <th className="py-2 text-right">Dividendes</th>
                                                     </tr>
                                                 </thead>
                                                 <tbody className="divide-y divide-slate-100 font-medium text-slate-700">
@@ -753,6 +930,9 @@
                                                                     {pos.plusValue >= 0 ? '+' : ''}{pos.performance.toFixed(2)}%
                                                                 </span>
                                                                 <div className="text-[10px] text-slate-400">{formatFCFA(pos.plusValue)}</div>
+                                                            </td>
+                                                            <td className="py-3 text-right text-violet-700 font-semibold">
+                                                                {dividendesStats.parAction[pos.symbole] ? formatFCFA(dividendesStats.parAction[pos.symbole]) : <span className="text-slate-300">—</span>}
                                                             </td>
                                                         </tr>
                                                     ))}
@@ -788,13 +968,17 @@
                                             <th className="px-5 py-3">Type</th>
                                             <th className="px-5 py-3">Poche</th>
                                             <th className="px-5 py-3">Détail Opération / Actif</th>
+                                            <th className="px-5 py-3 text-right">Brut</th>
+                                            <th className="px-5 py-3 text-right">Frais courtier</th>
                                             <th className="px-5 py-3 text-right">Débit (Achat/Sortie)</th>
                                             <th className="px-5 py-3 text-right">Crédit (Dépôt/Vente)</th>
                                             <th className="px-5 py-3 text-center">Action</th>
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y divide-slate-100 font-medium text-slate-700">
-                                        {transactions.map((t) => (
+                                        {transactions.map((t) => {
+                                            const fraisInfo = getTxFrais(t);
+                                            return (
                                             <tr key={t.id} className="hover:bg-slate-50/50 transition-colors">
                                                 <td className="px-5 py-3 whitespace-nowrap text-slate-500">{t.date.split('-').reverse().join('/')}</td>
                                                 <td className="px-5 py-3 whitespace-nowrap">
@@ -802,6 +986,7 @@
                                                         t.type === 'ACHAT' ? 'bg-emerald-50 text-emerald-700' :
                                                         t.type === 'VENTE' ? 'bg-amber-50 text-amber-700' :
                                                         t.type === 'DEPOT' ? 'bg-blue-50 text-blue-700' :
+                                                        t.type === 'DIVIDENDE' ? 'bg-violet-50 text-violet-700' :
                                                         'bg-rose-50 text-rose-700'
                                                     }`}>
                                                         {t.type}
@@ -816,13 +1001,29 @@
                                                 </td>
                                                 <td className="px-5 py-3">
                                                     <div className="font-bold text-slate-950">
-                                                        {t.type === 'ACHAT' || t.type === 'VENTE' ? `Action ${t.libelle}` : t.libelle}
+                                                        {t.type === 'ACHAT' || t.type === 'VENTE' ? `Action ${t.libelle}` : t.type === 'DIVIDENDE' ? `Dividende ${t.libelle}` : t.libelle}
                                                     </div>
                                                     {(t.type === 'ACHAT' || t.type === 'VENTE') && (
                                                         <div className="text-[11px] text-slate-400">
-                                                            Qté: {t.quantite} × Cours: {formatFCFA(t.cours)} (Frais incl.)
+                                                            Qté: {t.quantite} × {formatFCFA(t.cours)}
                                                         </div>
                                                     )}
+                                                    {t.type === 'DIVIDENDE' && (
+                                                        <div className="text-[11px] text-slate-400">
+                                                            {t.quantite && t.cours ? `Qté: ${t.quantite} × ${formatFCFA(t.cours)}/action` : 'Versement de dividende'}
+                                                        </div>
+                                                    )}
+                                                </td>
+                                                <td className="px-5 py-3 text-right text-slate-600 whitespace-nowrap">
+                                                    {fraisInfo ? formatFCFA(fraisInfo.brut) : "—"}
+                                                </td>
+                                                <td className="px-5 py-3 text-right whitespace-nowrap">
+                                                    {fraisInfo ? (
+                                                        <span className="font-semibold text-amber-700">
+                                                            {formatFCFA(fraisInfo.frais)}
+                                                            <span className="block text-[10px] text-amber-600/80">{fraisInfo.pct.toFixed(2)}%</span>
+                                                        </span>
+                                                    ) : "—"}
                                                 </td>
                                                 <td className="px-5 py-3 text-right font-semibold text-rose-600">{t.debit > 0 ? formatFCFA(t.debit) : "-"}</td>
                                                 <td className="px-5 py-3 text-right font-semibold text-emerald-600">{t.credit > 0 ? formatFCFA(t.credit) : "-"}</td>
@@ -837,7 +1038,7 @@
                                                     </div>
                                                 </td>
                                             </tr>
-                                        ))}
+                                        );})}
                                     </tbody>
                                 </table>
                             </div>
@@ -889,8 +1090,30 @@
                                                 </div>
                                             )}
                                             <div>
-                                                <label className="block text-[11px] font-bold text-slate-500 mb-1">Frais (facultatif, ~1.22% si vide)</label>
-                                                <input type="number" value={editForm.fraisManuels} onChange={(e) => setEditForm({ ...editForm, fraisManuels: e.target.value })} placeholder="Laisser vide pour recalcul" className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg" />
+                                                <label className="block text-[11px] font-bold text-slate-500 mb-1">Frais courtier (facultatif)</label>
+                                                <input type="number" value={editForm.fraisManuels} onChange={(e) => setEditForm({ ...editForm, fraisManuels: e.target.value })} placeholder={`Vide = ${(FRAIS_TAUX_DEFAUT * 100).toFixed(2)}% auto`} className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg" />
+                                            </div>
+                                            <FraisApercu apercu={apercuFraisEdit} type={editForm.type} />
+                                        </>
+                                    ) : editForm.type === 'DIVIDENDE' ? (
+                                        <>
+                                            <div>
+                                                <label className="block text-[11px] font-bold text-slate-500 mb-1">Action</label>
+                                                <input type="text" value={editForm.ticker} onChange={(e) => setEditForm({ ...editForm, ticker: e.target.value })} className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg font-bold uppercase" required />
+                                            </div>
+                                            <div className="grid grid-cols-2 gap-2">
+                                                <div>
+                                                    <label className="block text-[11px] font-bold text-slate-500 mb-1">Nombre d'actions</label>
+                                                    <input type="number" value={editForm.quantite} onChange={(e) => setEditForm({ ...editForm, quantite: e.target.value })} className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg" />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-[11px] font-bold text-slate-500 mb-1">Dividende / action</label>
+                                                    <input type="number" value={editForm.cours} onChange={(e) => setEditForm({ ...editForm, cours: e.target.value })} className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg" />
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-[11px] font-bold text-slate-500 mb-1">Montant net reçu (FCFA)</label>
+                                                <input type="number" value={editForm.fluxMontant} onChange={(e) => setEditForm({ ...editForm, fluxMontant: e.target.value })} placeholder="Ou calcul auto Qté × Div/action" className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg font-bold" />
                                             </div>
                                         </>
                                     ) : (
