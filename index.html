@@ -110,6 +110,75 @@
             return { brut, frais: Math.max(0, frais), pct: brut > 0 ? (Math.max(0, frais) / brut) * 100 : 0 };
         }
 
+        // Les transactions sont stockées du plus récent au plus ancien — il faut les
+        // rejouer dans l'ordre chronologique pour calculer correctement le portefeuille.
+        function sortTransactionsChrono(list) {
+            return [...list].sort((a, b) => {
+                const d = a.date.localeCompare(b.date);
+                if (d !== 0) return d;
+                return String(a.id).localeCompare(String(b.id));
+            });
+        }
+
+        function computePositions(list, prices, strat) {
+            const map = {};
+            sortTransactionsChrono(list).forEach(t => {
+                if (t.type === "ACHAT") {
+                    const sym = (t.libelle || '').toUpperCase().trim();
+                    if (!sym || !t.quantite) return;
+                    if (!map[sym]) map[sym] = { quantite: 0, coutTotal: 0 };
+                    map[sym].quantite += t.quantite;
+                    map[sym].coutTotal += t.debit;
+                } else if (t.type === "VENTE") {
+                    const sym = (t.libelle || '').toUpperCase().trim();
+                    if (!sym || !t.quantite || !map[sym] || map[sym].quantite <= 0) return;
+                    const qteVendue = Math.min(t.quantite, map[sym].quantite);
+                    const ratio = qteVendue / map[sym].quantite;
+                    map[sym].coutTotal -= map[sym].coutTotal * ratio;
+                    map[sym].quantite -= qteVendue;
+                }
+            });
+
+            const actives = [];
+            Object.keys(map).forEach(key => {
+                if (map[key].quantite > 0) {
+                    const pru = map[key].coutTotal / map[key].quantite;
+                    const coursActuel = prices[key] || pru;
+                    const valeurActuelle = map[key].quantite * coursActuel;
+                    const plusValue = valeurActuelle - map[key].coutTotal;
+                    actives.push({
+                        symbole: key,
+                        strategie: strat[key] || 'SPEC',
+                        quantite: map[key].quantite,
+                        coutTotal: map[key].coutTotal,
+                        pru,
+                        coursActuel,
+                        valeurActuelle,
+                        plusValue,
+                        performance: map[key].coutTotal > 0 ? (plusValue / map[key].coutTotal) * 100 : 0
+                    });
+                }
+            });
+            return actives;
+        }
+
+        function getQuantiteDetenue(list, symbole, excludeId) {
+            const map = {};
+            sortTransactionsChrono(list).forEach(t => {
+                if (excludeId && t.id === excludeId) return;
+                if (t.type === "ACHAT") {
+                    const sym = (t.libelle || '').toUpperCase().trim();
+                    if (sym !== symbole) return;
+                    map[sym] = (map[sym] || 0) + t.quantite;
+                } else if (t.type === "VENTE") {
+                    const sym = (t.libelle || '').toUpperCase().trim();
+                    if (sym !== symbole) return;
+                    map[sym] = (map[sym] || 0) - t.quantite;
+                }
+            });
+            return Math.max(0, map[symbole] || 0);
+        }
+
         function App() {
             const [transactions, setTransactions] = useState(() =>
                 loadState(KEYS.transactions, MIGRATED ? MIGRATED.transactions : [])
@@ -327,45 +396,11 @@
 
             const cashDisponible = useMemo(() => calcCash(transactions), [transactions]);
 
-            // Positions consolidées (PRU frais inclus), toutes poches confondues
-            const positions = useMemo(() => {
-                const map = {};
-                transactions.forEach(t => {
-                    if (t.type === "ACHAT") {
-                        if (!map[t.libelle]) map[t.libelle] = { quantite: 0, coutTotal: 0 };
-                        map[t.libelle].quantite += t.quantite;
-                        map[t.libelle].coutTotal += t.debit;
-                    } else if (t.type === "VENTE") {
-                        if (map[t.libelle] && map[t.libelle].quantite > 0) {
-                            const ratio = t.quantite / map[t.libelle].quantite;
-                            map[t.libelle].coutTotal -= map[t.libelle].coutTotal * ratio;
-                            map[t.libelle].quantite -= t.quantite;
-                        }
-                    }
-                });
-
-                const actives = [];
-                Object.keys(map).forEach(key => {
-                    if (map[key].quantite > 0) {
-                        const pru = map[key].coutTotal / map[key].quantite;
-                        const coursActuel = marketPrices[key] || pru;
-                        const valeurActuelle = map[key].quantite * coursActuel;
-                        const plusValue = valeurActuelle - map[key].coutTotal;
-                        actives.push({
-                            symbole: key,
-                            strategie: strategies[key] || 'SPEC',
-                            quantite: map[key].quantite,
-                            coutTotal: map[key].coutTotal,
-                            pru,
-                            coursActuel,
-                            valeurActuelle,
-                            plusValue,
-                            performance: map[key].coutTotal > 0 ? (plusValue / map[key].coutTotal) * 100 : 0
-                        });
-                    }
-                });
-                return actives;
-            }, [transactions, marketPrices, strategies]);
+            // Positions consolidées (PRU frais inclus), ordre chronologique respecté
+            const positions = useMemo(
+                () => computePositions(transactions, marketPrices, strategies),
+                [transactions, marketPrices, strategies]
+            );
 
             const positionsFiltrees = useMemo(() =>
                 filtrePoche === "TOUS" ? positions : positions.filter(p => p.strategie === filtrePoche),
@@ -466,6 +501,15 @@
                     }
                 }
 
+                if (formType === "VENTE") {
+                    const detenu = getQuantiteDetenue(transactions, built.libelle);
+                    if (built.quantite > detenu) {
+                        alert(`Impossible de vendre ${built.quantite} ${built.libelle} : vous n'en détenez que ${detenu}.`);
+                        setIsSaving(false);
+                        return;
+                    }
+                }
+
                 setTransactions(prev => [{ id: Date.now().toString(), ...built }, ...prev]);
                 setFluxMontant(""); setTicker(""); setQuantite(""); setCours(""); setFraisManuels("");
                 setTimeout(() => setIsSaving(false), 150);
@@ -504,6 +548,14 @@
                         return;
                     }
                     setStrategies(prev => ({ ...prev, [built.libelle]: editForm.poche || prev[built.libelle] || 'SPEC' }));
+                }
+
+                if (editForm.type === "VENTE") {
+                    const detenu = getQuantiteDetenue(transactions, built.libelle, editingTxId);
+                    if (built.quantite > detenu) {
+                        alert(`Impossible de vendre ${built.quantite} ${built.libelle} : vous n'en détenez que ${detenu}.`);
+                        return;
+                    }
                 }
 
                 setTransactions(prev => prev.map(t => t.id === editingTxId ? { ...built, id: t.id } : t));
