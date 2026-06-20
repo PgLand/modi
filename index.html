@@ -110,6 +110,104 @@
             return { brut, frais: Math.max(0, frais), pct: brut > 0 ? (Math.max(0, frais) / brut) * 100 : 0 };
         }
 
+        // Corrige symboles, montants bruts et frais sur les anciennes opérations achat/vente.
+        function normalizeTransaction(t) {
+            if (t.type === 'DIVIDENDE') {
+                const libelle = (t.libelle || '').toUpperCase().trim();
+                return libelle === t.libelle ? t : { ...t, libelle };
+            }
+            if (t.type !== 'ACHAT' && t.type !== 'VENTE') return t;
+
+            const libelle = (t.libelle || '').toUpperCase().trim();
+            const qty = t.quantite;
+            const price = t.cours;
+            if (!libelle || !qty || !price) return { ...t, libelle };
+
+            const totalBrut = t.montantBrut != null ? t.montantBrut : qty * price;
+            let frais = t.frais;
+
+            if (frais == null) {
+                if (t.type === 'ACHAT' && t.debit > totalBrut) frais = t.debit - totalBrut;
+                else if (t.type === 'VENTE' && t.credit > 0 && t.credit < totalBrut) frais = totalBrut - t.credit;
+                else frais = Math.round(totalBrut * FRAIS_TAUX_DEFAUT);
+            }
+            frais = Math.max(0, Math.round(frais));
+            const fraisPct = totalBrut > 0 ? (frais / totalBrut) * 100 : 0;
+            const debit = t.type === 'ACHAT' ? totalBrut + frais : 0;
+            const credit = t.type === 'VENTE' ? totalBrut - frais : (t.credit || 0);
+
+            return {
+                ...t,
+                libelle,
+                montantBrut: totalBrut,
+                frais,
+                fraisPct,
+                debit: t.type === 'ACHAT' ? debit : (t.debit || 0),
+                credit: t.type === 'VENTE' ? credit : (t.credit || 0)
+            };
+        }
+
+        function previewGainVente(positions, symbole, qtyStr, priceStr, fraisManuelsStr) {
+            const sym = (symbole || '').toUpperCase().trim();
+            const q = parseInt(qtyStr);
+            const p = parseFloat(priceStr);
+            if (!sym || isNaN(q) || q <= 0 || isNaN(p) || p <= 0) return null;
+            const pos = positions.find(item => item.symbole === sym);
+            if (!pos) return { error: 'no_position' };
+            const fraisOp = calcFraisOperation('VENTE', q, p, fraisManuelsStr);
+            if (!fraisOp) return null;
+            const coutRevient = pos.pru * q;
+            const gainRealise = fraisOp.totalNet - coutRevient;
+            return {
+                ...fraisOp,
+                pru: pos.pru,
+                coutRevient,
+                gainRealise,
+                perfPct: coutRevient > 0 ? (gainRealise / coutRevient) * 100 : 0
+            };
+        }
+
+        function computeVenteGains(list) {
+            const gainsById = {};
+            let totalGainRealise = 0;
+            const map = {};
+
+            sortTransactionsChrono(list).forEach(t => {
+                if (t.type === 'ACHAT') {
+                    const sym = (t.libelle || '').toUpperCase().trim();
+                    if (!sym || !t.quantite) return;
+                    if (!map[sym]) map[sym] = { quantite: 0, coutTotal: 0 };
+                    map[sym].quantite += t.quantite;
+                    map[sym].coutTotal += t.debit;
+                } else if (t.type === 'VENTE') {
+                    const sym = (t.libelle || '').toUpperCase().trim();
+                    if (!sym || !t.quantite || !map[sym] || map[sym].quantite <= 0) return;
+                    const qteVendue = Math.min(t.quantite, map[sym].quantite);
+                    const pruVente = map[sym].coutTotal / map[sym].quantite;
+                    const coutRevient = pruVente * qteVendue;
+                    const normalized = normalizeTransaction(t);
+                    const produitNet = normalized.credit;
+                    const gainRealise = produitNet - coutRevient;
+
+                    gainsById[t.id] = {
+                        qteVendue,
+                        pruVente,
+                        coutRevient,
+                        produitNet,
+                        gainRealise,
+                        perfPct: coutRevient > 0 ? (gainRealise / coutRevient) * 100 : 0
+                    };
+                    totalGainRealise += gainRealise;
+
+                    const ratio = qteVendue / map[sym].quantite;
+                    map[sym].coutTotal -= map[sym].coutTotal * ratio;
+                    map[sym].quantite -= qteVendue;
+                }
+            });
+
+            return { gainsById, totalGainRealise };
+        }
+
         // Les transactions sont stockées du plus récent au plus ancien — il faut les
         // rejouer dans l'ordre chronologique pour calculer correctement le portefeuille.
         function sortTransactionsChrono(list) {
@@ -181,8 +279,16 @@
 
         function App() {
             const [transactions, setTransactions] = useState(() =>
-                loadState(KEYS.transactions, MIGRATED ? MIGRATED.transactions : [])
+                (loadState(KEYS.transactions, MIGRATED ? MIGRATED.transactions : [])).map(normalizeTransaction)
             );
+
+            // Migration unique : recalcule frais/crédits sur les anciennes ventes sans frais.
+            useEffect(() => {
+                setTransactions(prev => {
+                    const next = prev.map(normalizeTransaction);
+                    return JSON.stringify(next) === JSON.stringify(prev) ? prev : next;
+                });
+            }, []);
             const [marketPrices, setMarketPrices] = useState(() =>
                 loadState(KEYS.marketPrices, MIGRATED ? MIGRATED.marketPrices : {})
             );
@@ -394,17 +500,55 @@
                 };
             };
 
-            const cashDisponible = useMemo(() => calcCash(transactions), [transactions]);
+            const cashDisponible = useMemo(() => calcCash(transactions.map(normalizeTransaction)), [transactions]);
 
             // Positions consolidées (PRU frais inclus), ordre chronologique respecté
             const positions = useMemo(
-                () => computePositions(transactions, marketPrices, strategies),
+                () => computePositions(transactions.map(normalizeTransaction), marketPrices, strategies),
                 [transactions, marketPrices, strategies]
             );
 
-            const positionsFiltrees = useMemo(() =>
-                filtrePoche === "TOUS" ? positions : positions.filter(p => p.strategie === filtrePoche),
-            [positions, filtrePoche]);
+            const dividendesStats = useMemo(() => {
+                const parAction = {};
+                let total = 0;
+                transactions.forEach(t => {
+                    if (t.type === "DIVIDENDE") {
+                        const sym = (t.libelle || '').toUpperCase().trim();
+                        if (!sym) return;
+                        total += t.credit || 0;
+                        parAction[sym] = (parAction[sym] || 0) + (t.credit || 0);
+                    }
+                });
+                return { total, parAction };
+            }, [transactions]);
+
+            const positionsFiltrees = useMemo(() => {
+                const bySym = {};
+                positions.forEach(p => { bySym[p.symbole] = { ...p, vendu: false }; });
+                Object.keys(dividendesStats.parAction).forEach(sym => {
+                    if (!bySym[sym]) {
+                        bySym[sym] = {
+                            symbole: sym,
+                            strategie: strategies[sym] || 'SPEC',
+                            quantite: 0,
+                            coutTotal: 0,
+                            pru: 0,
+                            coursActuel: marketPrices[sym] || 0,
+                            valeurActuelle: 0,
+                            plusValue: 0,
+                            performance: 0,
+                            vendu: true
+                        };
+                    }
+                });
+                const all = Object.values(bySym);
+                return filtrePoche === "TOUS" ? all : all.filter(p => p.strategie === filtrePoche && !p.vendu);
+            }, [positions, filtrePoche, dividendesStats.parAction, strategies, marketPrices]);
+
+            const venteStats = useMemo(
+                () => computeVenteGains(transactions.map(normalizeTransaction)),
+                [transactions]
+            );
 
             // Indicateurs globaux
             const valeurTotale = useMemo(() =>
@@ -431,23 +575,11 @@
                 return res;
             }, [positions]);
 
-            const dividendesStats = useMemo(() => {
-                const parAction = {};
-                let total = 0;
-                transactions.forEach(t => {
-                    if (t.type === "DIVIDENDE") {
-                        total += t.credit || 0;
-                        parAction[t.libelle] = (parAction[t.libelle] || 0) + (t.credit || 0);
-                    }
-                });
-                return { total, parAction };
-            }, [transactions]);
-
             const fraisStats = useMemo(() => {
                 let totalFrais = 0;
                 let volumeBrut = 0;
                 transactions.forEach(t => {
-                    const info = getTxFrais(t);
+                    const info = getTxFrais(normalizeTransaction(t));
                     if (info) {
                         totalFrais += info.frais;
                         volumeBrut += info.brut;
@@ -465,6 +597,11 @@
                 if (formType !== 'ACHAT' && formType !== 'VENTE') return null;
                 return calcFraisOperation(formType, quantite, cours, fraisManuels);
             }, [formType, quantite, cours, fraisManuels]);
+
+            const apercuGainVenteForm = useMemo(() => {
+                if (formType !== 'VENTE') return null;
+                return previewGainVente(positions, ticker, quantite, cours, fraisManuels);
+            }, [formType, positions, ticker, quantite, cours, fraisManuels]);
 
             const apercuFraisEdit = useMemo(() => {
                 if (!editForm || (editForm.type !== 'ACHAT' && editForm.type !== 'VENTE')) return null;
@@ -510,7 +647,7 @@
                     }
                 }
 
-                setTransactions(prev => [{ id: Date.now().toString(), ...built }, ...prev]);
+                setTransactions(prev => [{ id: Date.now().toString(), ...normalizeTransaction(built) }, ...prev]);
                 setFluxMontant(""); setTicker(""); setQuantite(""); setCours(""); setFraisManuels("");
                 setTimeout(() => setIsSaving(false), 150);
             };
@@ -558,7 +695,7 @@
                     }
                 }
 
-                setTransactions(prev => prev.map(t => t.id === editingTxId ? { ...built, id: t.id } : t));
+                setTransactions(prev => prev.map(t => t.id === editingTxId ? normalizeTransaction({ ...built, id: t.id }) : t));
                 setEditingTxId(null);
                 setEditForm(null);
             };
@@ -632,9 +769,36 @@
                             <span className="font-bold">{formatFCFA(apercu.frais)} · {apercu.pct.toFixed(2)}%</span>
                         </div>
                         <div className="flex justify-between gap-2 border-t border-amber-200 pt-1.5">
-                            <span className="font-bold text-slate-800">{type === 'ACHAT' ? 'Total à débiter' : 'Total à créditer'}</span>
+                            <span className="font-bold text-slate-800">{type === 'ACHAT' ? 'Total à débiter' : 'Net crédité (après frais)'}</span>
                             <span className="font-black text-slate-900">{formatFCFA(apercu.totalNet)}</span>
                         </div>
+                    </div>
+                );
+            };
+
+            const GainVenteApercu = ({ apercu }) => {
+                if (!apercu || apercu.error) return null;
+                const positif = apercu.gainRealise >= 0;
+                return (
+                    <div className={`rounded-lg border p-3 text-xs space-y-1.5 ${positif ? 'border-emerald-200 bg-emerald-50/60' : 'border-rose-200 bg-rose-50/60'}`}>
+                        <div className={`font-bold uppercase tracking-wide text-[10px] ${positif ? 'text-emerald-800' : 'text-rose-800'}`}>
+                            Résultat estimé de la vente
+                        </div>
+                        <div className="flex justify-between gap-2">
+                            <span className="text-slate-600">Coût de revient (PRU × qté)</span>
+                            <span className="font-bold text-slate-800">{formatFCFA(apercu.coutRevient)}</span>
+                        </div>
+                        <div className="flex justify-between gap-2">
+                            <span className="text-slate-600">PRU moyen</span>
+                            <span className="font-bold text-slate-700">{formatFCFA(apercu.pru)}</span>
+                        </div>
+                        <div className="flex justify-between gap-2 border-t border-slate-200/80 pt-1.5">
+                            <span className="font-bold text-slate-800">{positif ? 'Gain net' : 'Perte nette'}</span>
+                            <span className={`font-black ${positif ? 'text-emerald-700' : 'text-rose-700'}`}>
+                                {positif ? '+' : ''}{formatFCFA(apercu.gainRealise)} ({positif ? '+' : ''}{apercu.perfPct.toFixed(2)}%)
+                            </span>
+                        </div>
+                        <p className="text-[10px] text-slate-500">Frais de courtage déjà déduits du montant net crédité.</p>
                     </div>
                 );
             };
@@ -733,7 +897,7 @@
                         <div className="space-y-6">
 
                             {/* Chiffres clés */}
-                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
+                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-7 gap-4">
                                 <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
                                     <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Patrimoine Total</span>
                                     <h3 className="text-2xl font-black text-slate-900 mt-1">{formatFCFA(valeurTotale)}</h3>
@@ -764,6 +928,13 @@
                                     <span className="text-xs font-bold text-violet-600 uppercase tracking-wider">Dividendes Perçus</span>
                                     <h3 className="text-2xl font-black text-violet-700 mt-1">{formatFCFA(dividendesStats.total)}</h3>
                                     <p className="text-xs text-slate-400 mt-1">Revenus versés par vos actions</p>
+                                </div>
+                                <div className="bg-white p-5 rounded-xl border border-amber-100 bg-amber-50/20 shadow-sm">
+                                    <span className="text-xs font-bold text-amber-700 uppercase tracking-wider">Plus-values Réalisées</span>
+                                    <h3 className={`text-2xl font-black mt-1 ${venteStats.totalGainRealise >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                        {venteStats.totalGainRealise >= 0 ? '+' : ''}{formatFCFA(venteStats.totalGainRealise)}
+                                    </h3>
+                                    <p className="text-xs text-slate-400 mt-1">Gains/pertes nets après frais de vente</p>
                                 </div>
                                 <div className="bg-white p-5 rounded-xl border border-amber-100 bg-amber-50/20 shadow-sm">
                                     <span className="text-xs font-bold text-amber-700 uppercase tracking-wider">Frais Courtier</span>
@@ -868,6 +1039,7 @@
                                                     <input type="number" value={fraisManuels} onChange={(e) => setFraisManuels(e.target.value)} placeholder="Laisser vide pour estimation auto" className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-lg text-slate-500 focus:outline-none focus:border-indigo-600" />
                                                 </div>
                                                 <FraisApercu apercu={apercuFraisForm} type={formType} />
+                                                {formType === "VENTE" && <GainVenteApercu apercu={apercuGainVenteForm} />}
                                             </>
                                         ) : formType === "DIVIDENDE" ? (
                                             <>
@@ -956,14 +1128,24 @@
                                                 </thead>
                                                 <tbody className="divide-y divide-slate-100 font-medium text-slate-700">
                                                     {positionsFiltrees.map(pos => (
-                                                        <tr key={pos.symbole} className="hover:bg-slate-50/50 transition-colors">
-                                                            <td className="py-3 font-bold text-slate-900">{pos.symbole}</td>
-                                                            <td className="py-3">
-                                                                <BadgeStrategie strategie={pos.strategie} onClick={() => handleToggleStrategie(pos.symbole)} />
+                                                        <tr key={pos.symbole} className={`hover:bg-slate-50/50 transition-colors ${pos.vendu ? 'bg-slate-50/80' : ''}`}>
+                                                            <td className="py-3 font-bold text-slate-900">
+                                                                {pos.symbole}
+                                                                {pos.vendu && <span className="ml-1.5 text-[10px] font-bold text-slate-400 uppercase">Vendu</span>}
                                                             </td>
-                                                            <td className="py-3 text-center">{pos.quantite}</td>
-                                                            <td className="py-3 text-right">{formatFCFA(pos.pru)}</td>
+                                                            <td className="py-3">
+                                                                {pos.vendu ? (
+                                                                    <span className="text-[10px] text-slate-400">—</span>
+                                                                ) : (
+                                                                    <BadgeStrategie strategie={pos.strategie} onClick={() => handleToggleStrategie(pos.symbole)} />
+                                                                )}
+                                                            </td>
+                                                            <td className="py-3 text-center">{pos.vendu ? <span className="text-slate-300">0</span> : pos.quantite}</td>
+                                                            <td className="py-3 text-right">{pos.vendu ? <span className="text-slate-300">—</span> : formatFCFA(pos.pru)}</td>
                                                             <td className="py-3 text-right">
+                                                                {pos.vendu ? (
+                                                                    <span className="text-slate-300">—</span>
+                                                                ) : (
                                                                 <div className="flex items-center justify-end gap-1.5">
                                                                     <input
                                                                         type="number"
@@ -975,13 +1157,20 @@
                                                                     />
                                                                     <span className="text-[10px] text-slate-400">XOF</span>
                                                                 </div>
+                                                                )}
                                                             </td>
-                                                            <td className="py-3 text-right font-semibold text-slate-800">{formatFCFA(pos.valeurActuelle)}</td>
+                                                            <td className="py-3 text-right font-semibold text-slate-800">{pos.vendu ? <span className="text-slate-300">—</span> : formatFCFA(pos.valeurActuelle)}</td>
                                                             <td className="py-3 text-right">
+                                                                {pos.vendu ? (
+                                                                    <span className="text-slate-300">—</span>
+                                                                ) : (
+                                                                <>
                                                                 <span className={`font-bold ${pos.plusValue >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                                                                     {pos.plusValue >= 0 ? '+' : ''}{pos.performance.toFixed(2)}%
                                                                 </span>
                                                                 <div className="text-[10px] text-slate-400">{formatFCFA(pos.plusValue)}</div>
+                                                                </>
+                                                                )}
                                                             </td>
                                                             <td className="py-3 text-right text-violet-700 font-semibold">
                                                                 {dividendesStats.parAction[pos.symbole] ? formatFCFA(dividendesStats.parAction[pos.symbole]) : <span className="text-slate-300">—</span>}
@@ -1022,6 +1211,7 @@
                                             <th className="px-5 py-3">Détail Opération / Actif</th>
                                             <th className="px-5 py-3 text-right">Brut</th>
                                             <th className="px-5 py-3 text-right">Frais courtier</th>
+                                            <th className="px-5 py-3 text-right">Gain/Perte vente</th>
                                             <th className="px-5 py-3 text-right">Débit (Achat/Sortie)</th>
                                             <th className="px-5 py-3 text-right">Crédit (Dépôt/Vente)</th>
                                             <th className="px-5 py-3 text-center">Action</th>
@@ -1029,7 +1219,9 @@
                                     </thead>
                                     <tbody className="divide-y divide-slate-100 font-medium text-slate-700">
                                         {transactions.map((t) => {
-                                            const fraisInfo = getTxFrais(t);
+                                            const tx = normalizeTransaction(t);
+                                            const fraisInfo = getTxFrais(tx);
+                                            const gainVente = tx.type === 'VENTE' ? venteStats.gainsById[t.id] : null;
                                             return (
                                             <tr key={t.id} className="hover:bg-slate-50/50 transition-colors">
                                                 <td className="px-5 py-3 whitespace-nowrap text-slate-500">{t.date.split('-').reverse().join('/')}</td>
@@ -1058,6 +1250,11 @@
                                                     {(t.type === 'ACHAT' || t.type === 'VENTE') && (
                                                         <div className="text-[11px] text-slate-400">
                                                             Qté: {t.quantite} × {formatFCFA(t.cours)}
+                                                            {gainVente && (
+                                                                <span className={`ml-2 font-bold ${gainVente.gainRealise >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                                                    · {gainVente.gainRealise >= 0 ? 'Gain' : 'Perte'} {gainVente.gainRealise >= 0 ? '+' : ''}{formatFCFA(gainVente.gainRealise)}
+                                                                </span>
+                                                            )}
                                                         </div>
                                                     )}
                                                     {t.type === 'DIVIDENDE' && (
@@ -1077,8 +1274,16 @@
                                                         </span>
                                                     ) : "—"}
                                                 </td>
-                                                <td className="px-5 py-3 text-right font-semibold text-rose-600">{t.debit > 0 ? formatFCFA(t.debit) : "-"}</td>
-                                                <td className="px-5 py-3 text-right font-semibold text-emerald-600">{t.credit > 0 ? formatFCFA(t.credit) : "-"}</td>
+                                                <td className="px-5 py-3 text-right whitespace-nowrap">
+                                                    {gainVente ? (
+                                                        <span className={`font-bold ${gainVente.gainRealise >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
+                                                            {gainVente.gainRealise >= 0 ? '+' : ''}{formatFCFA(gainVente.gainRealise)}
+                                                            <span className="block text-[10px] opacity-80">{gainVente.gainRealise >= 0 ? '+' : ''}{gainVente.perfPct.toFixed(2)}%</span>
+                                                        </span>
+                                                    ) : "—"}
+                                                </td>
+                                                <td className="px-5 py-3 text-right font-semibold text-rose-600">{tx.debit > 0 ? formatFCFA(tx.debit) : "-"}</td>
+                                                <td className="px-5 py-3 text-right font-semibold text-emerald-600">{tx.credit > 0 ? formatFCFA(tx.credit) : "-"}</td>
                                                 <td className="px-5 py-3 text-center">
                                                     <div className="flex items-center justify-center gap-1">
                                                         <button onClick={() => handleOpenEdit(t)} className="text-slate-400 hover:text-indigo-600 p-1 rounded-md hover:bg-slate-100 transition" title="Modifier la transaction">
