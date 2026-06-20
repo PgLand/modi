@@ -1,4 +1,4 @@
-const CACHE_NAME = 'brvm-gestion-v6';
+const CACHE_NAME = 'brvm-gestion-v7';
 const APP_SHELL = [
   './',
   './index.html',
@@ -7,6 +7,16 @@ const APP_SHELL = [
   './icons/icon-512.png',
   './icons/icon-maskable.png'
 ];
+
+function isNetworkFirstAsset(url) {
+  const p = url.pathname;
+  return (
+    isAppDocument(url) ||
+    p.endsWith('manifest.webmanifest') ||
+    p.endsWith('sw.js') ||
+    p.endsWith('cours-brvm.json')
+  );
+}
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -35,8 +45,8 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
 
   if (url.origin === self.location.origin) {
-    // HTML : réseau d'abord pour avoir la dernière version rapidement
-    if (isAppDocument(url) || url.pathname.endsWith('manifest.webmanifest') || url.pathname.endsWith('sw.js')) {
+    // HTML et cours BRVM : réseau d'abord pour avoir la dernière version
+    if (isNetworkFirstAsset(url)) {
       event.respondWith(
         fetch(event.request)
           .then((response) => {
